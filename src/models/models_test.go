@@ -1,6 +1,7 @@
 package models
 
 import (
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -18,6 +19,87 @@ func TestConstants(t *testing.T) {
 
 	if DEFAULT_PASSPHRASE != "pass123" {
 		t.Errorf("DEFAULT_PASSPHRASE = %s, want %s", DEFAULT_PASSPHRASE, "pass123")
+	}
+
+	if DEFAULT_RELAY != defaultRelayHost {
+		t.Errorf("DEFAULT_RELAY = %s, want unresolved host %s", DEFAULT_RELAY, defaultRelayHost)
+	}
+
+	if DEFAULT_RELAY6 != defaultRelay6Host {
+		t.Errorf("DEFAULT_RELAY6 = %s, want unresolved host %s", DEFAULT_RELAY6, defaultRelay6Host)
+	}
+}
+
+func TestResolveDefaultRelay(t *testing.T) {
+	tests := []struct {
+		name         string
+		address      string
+		resolvedHost string
+		want         string
+		wantLookup   bool
+	}{
+		{
+			name:         "default ipv4 keeps custom port",
+			address:      net.JoinHostPort(defaultRelayHost, "9010"),
+			resolvedHost: "192.0.2.10",
+			want:         "192.0.2.10:9010",
+			wantLookup:   true,
+		},
+		{
+			name:         "default ipv6 keeps custom port",
+			address:      net.JoinHostPort(defaultRelay6Host, "9011"),
+			resolvedHost: "2001:db8::10",
+			want:         "[2001:db8::10]:9011",
+			wantLookup:   true,
+		},
+		{
+			name:         "default host without port uses default port",
+			address:      defaultRelayHost,
+			resolvedHost: "192.0.2.11",
+			want:         "192.0.2.11:9009",
+			wantLookup:   true,
+		},
+		{
+			name:       "custom ip is unchanged",
+			address:    "127.0.0.1:9009",
+			want:       "127.0.0.1:9009",
+			wantLookup: false,
+		},
+		{
+			name:       "custom hostname is unchanged",
+			address:    "relay.example.test:9009",
+			want:       "relay.example.test:9009",
+			wantLookup: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lookupCalls := 0
+			got, err := resolveDefaultRelay(tt.address, func(string) (string, error) {
+				lookupCalls++
+				return tt.resolvedHost, nil
+			})
+			if err != nil {
+				t.Fatalf("resolveDefaultRelay() error = %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("resolveDefaultRelay() = %s, want %s", got, tt.want)
+			}
+			if gotLookup := lookupCalls > 0; gotLookup != tt.wantLookup {
+				t.Errorf("resolver called = %v, want %v", gotLookup, tt.wantLookup)
+			}
+		})
+	}
+}
+
+func TestResolveDefaultRelayReturnsLookupError(t *testing.T) {
+	wantErr := errors.New("lookup failed")
+	_, err := resolveDefaultRelay(net.JoinHostPort(defaultRelayHost, "9010"), func(string) (string, error) {
+		return "", wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("resolveDefaultRelay() error = %v, want %v", err, wantErr)
 	}
 }
 

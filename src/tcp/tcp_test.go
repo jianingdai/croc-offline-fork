@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/schollz/croc/v10/src/models"
 	log "github.com/schollz/logger"
 	"github.com/stretchr/testify/assert"
 )
@@ -43,6 +44,57 @@ func TestHandshakeOptions(t *testing.T) {
 	assert.Error(t, WithHandshakeTimeout(0)(s))
 	assert.Error(t, WithHandshakeTimeout(-time.Second)(s))
 	assert.Equal(t, 2*time.Minute, s.handshakeTimeout)
+}
+
+func TestConnectToTCPServerLazyRelayResolution(t *testing.T) {
+	originalResolver := resolveDefaultRelay
+	t.Cleanup(func() {
+		resolveDefaultRelay = originalResolver
+	})
+
+	t.Run("default relay resolves before dial", func(t *testing.T) {
+		_, localAddress, stopServer := startConfiguredTestServer(t)
+		defer stopServer()
+
+		defaultAddress := net.JoinHostPort(models.DEFAULT_RELAY, "9010")
+		resolverCalls := 0
+		resolveDefaultRelay = func(address string) (string, error) {
+			resolverCalls++
+			if address != defaultAddress {
+				t.Fatalf("resolver address = %s, want %s", address, defaultAddress)
+			}
+			return localAddress, nil
+		}
+
+		connection, _, _, err := ConnectToTCPServer(defaultAddress, "pass123", "lazy-default-relay")
+		if err != nil {
+			t.Fatalf("ConnectToTCPServer() error = %v", err)
+		}
+		connection.Close()
+		if resolverCalls != 1 {
+			t.Fatalf("resolver calls = %d, want 1", resolverCalls)
+		}
+	})
+
+	t.Run("custom relay skips default resolver", func(t *testing.T) {
+		_, localAddress, stopServer := startConfiguredTestServer(t)
+		defer stopServer()
+
+		resolverCalls := 0
+		resolveDefaultRelay = func(address string) (string, error) {
+			resolverCalls++
+			return "", fmt.Errorf("unexpected resolver call for %s", address)
+		}
+
+		connection, _, _, err := ConnectToTCPServer(localAddress, "pass123", "custom-relay")
+		if err != nil {
+			t.Fatalf("ConnectToTCPServer() error = %v", err)
+		}
+		connection.Close()
+		if resolverCalls != 0 {
+			t.Fatalf("resolver calls = %d, want 0", resolverCalls)
+		}
+	})
 }
 
 func TestAdmitToRoomEvictsOldestWaitingRoom(t *testing.T) {

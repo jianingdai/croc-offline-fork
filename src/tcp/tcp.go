@@ -659,9 +659,18 @@ func PingServer(address string) (err error) {
 	return fmt.Errorf("no pong")
 }
 
+var resolveDefaultRelay = models.ResolveDefaultRelay
+
 // ConnectToTCPServer will initiate a new connection
 // to the specified address, room with optional time limit
 func ConnectToTCPServer(address, password, room string, timelimit ...time.Duration) (c *comm.Comm, banner string, ipaddr string, err error) {
+	if models.IsDefaultRelay(address) {
+		address, err = resolveDefaultRelay(address)
+		if err != nil {
+			err = fmt.Errorf("failed to resolve default relay: %w", err)
+			return
+		}
+	}
 	if len(timelimit) > 0 {
 		c, err = comm.NewConnection(address, timelimit[0])
 	} else {

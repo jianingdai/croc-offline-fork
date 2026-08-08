@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/schollz/croc/v10/src/utils"
@@ -15,10 +16,15 @@ import (
 // TCP_BUFFER_SIZE is the maximum packet size
 const TCP_BUFFER_SIZE = 1024 * 64
 
+const (
+	defaultRelayHost  = "croc.schollz.com"
+	defaultRelay6Host = "croc6.schollz.com"
+)
+
 // DEFAULT_RELAY is the default relay used (can be set using --relay)
 var (
-	DEFAULT_RELAY      = "croc.schollz.com"
-	DEFAULT_RELAY6     = "croc6.schollz.com"
+	DEFAULT_RELAY      = defaultRelayHost
+	DEFAULT_RELAY6     = defaultRelay6Host
 	DEFAULT_PORT       = "9009"
 	DEFAULT_PASSPHRASE = "pass123"
 	INTERNAL_DNS       = false
@@ -83,22 +89,37 @@ func init() {
 		}
 	}
 	log.Trace("Using internal DNS: ", INTERNAL_DNS)
-	var err error
-	var addr string
-	addr, err = lookup(DEFAULT_RELAY)
-	if err == nil {
-		DEFAULT_RELAY = net.JoinHostPort(addr, DEFAULT_PORT)
-	} else {
-		DEFAULT_RELAY = ""
+}
+
+// IsDefaultRelay reports whether address uses an official default relay host.
+func IsDefaultRelay(address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
 	}
-	log.Tracef("Default ipv4 relay: %s", addr)
-	addr, err = lookup(DEFAULT_RELAY6)
-	if err == nil {
-		DEFAULT_RELAY6 = net.JoinHostPort(addr, DEFAULT_PORT)
-	} else {
-		DEFAULT_RELAY6 = ""
+	host = strings.TrimSuffix(host, ".")
+	return strings.EqualFold(host, defaultRelayHost) || strings.EqualFold(host, defaultRelay6Host)
+}
+
+// ResolveDefaultRelay resolves an official relay only when it is about to be used.
+func ResolveDefaultRelay(address string) (string, error) {
+	return resolveDefaultRelay(address, lookup)
+}
+
+func resolveDefaultRelay(address string, resolver func(string) (string, error)) (string, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+		port = DEFAULT_PORT
 	}
-	log.Tracef("Default ipv6 relay: %s", addr)
+	if !IsDefaultRelay(address) {
+		return address, nil
+	}
+	resolvedHost, err := resolver(host)
+	if err != nil {
+		return "", err
+	}
+	return net.JoinHostPort(resolvedHost, port), nil
 }
 
 // Resolve a hostname to an IP address using DNS.
