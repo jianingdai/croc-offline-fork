@@ -109,6 +109,9 @@ type Options struct {
 	Quiet             bool
 	DisableClipboard  bool
 	ExtendedClipboard bool
+	// SuppressSendInstructions disables sender share instructions, QR output,
+	// and clipboard integration without suppressing transfer status or logs.
+	SuppressSendInstructions bool
 }
 
 type SimpleMessage struct {
@@ -178,9 +181,10 @@ type Client struct {
 	// overwrite c.Options.RelayPorts are launched.
 	localRelayPort string
 
-	bar             *progressbar.ProgressBar
-	longestFilename int
-	firstSend       bool
+	bar                      *progressbar.ProgressBar
+	longestFilename          int
+	firstSend                bool
+	sendInstructionPresenter sendInstructionPresenter
 
 	mutex                    *sync.Mutex
 	fread                    *os.File
@@ -245,6 +249,7 @@ func New(ops Options) (c *Client, err error) {
 
 	// setup basic info
 	c.Options = ops
+	c.sendInstructionPresenter = defaultSendInstructionPresenter()
 	Debug(c.Options.Debug)
 
 	// redirect stderr to null if quiet mode is enabled
@@ -1411,23 +1416,7 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 	if err != nil {
 		return
 	}
-	flags := &strings.Builder{}
-	if c.Options.RelayAddress != models.DEFAULT_RELAY && !c.Options.OnlyLocal {
-		flags.WriteString("--relay " + c.Options.RelayAddress + " ")
-	}
-	if c.Options.RelayPassword != models.DEFAULT_PASSPHRASE {
-		flags.WriteString("--pass " + c.Options.RelayPassword + " ")
-	}
-	webURL := webReceiveURL(c.Options.SharedSecret)
-	output, colorEnabled := termui.Output(os.Stderr)
-	fmt.Fprint(output, formatSendInstructions(c.Options.SharedSecret, flags.String(), webURL, colorEnabled))
-	if !c.Options.DisableClipboard {
-		clipboardText := formatClipboardText(c.Options.SharedSecret, flags.String(), c.Options.ExtendedClipboard)
-		copyToClipboard(clipboardText, c.Options.Quiet, c.Options.ExtendedClipboard)
-	}
-	if c.Options.ShowQrCode {
-		showReceiveCommandQrCode(webURL)
-	}
+	c.presentSendInstructions()
 	if c.Options.Ask {
 		machid, _ := machineid.ID()
 		fmt.Fprintf(os.Stderr, "\rYour machine ID is '%s'\n", machid)

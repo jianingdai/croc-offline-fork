@@ -2,9 +2,12 @@ package croc
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"strconv"
 	"strings"
 
+	"github.com/schollz/croc/v10/src/models"
 	"github.com/schollz/croc/v10/src/termui"
 )
 
@@ -12,6 +15,51 @@ const (
 	secretColorPrefix = termui.Yellow
 	colorReset        = termui.Reset
 )
+
+type sendInstructionPresenter struct {
+	output          func() (io.Writer, bool)
+	copyToClipboard func(string, bool, bool)
+	showQRCode      func(string)
+}
+
+func defaultSendInstructionPresenter() sendInstructionPresenter {
+	return sendInstructionPresenter{
+		output: func() (io.Writer, bool) {
+			return termui.Output(os.Stderr)
+		},
+		copyToClipboard: copyToClipboard,
+		showQRCode:      showReceiveCommandQrCode,
+	}
+}
+
+func (c *Client) presentSendInstructions() {
+	if c.Options.SuppressSendInstructions {
+		return
+	}
+
+	presenter := c.sendInstructionPresenter
+	if presenter.output == nil {
+		presenter = defaultSendInstructionPresenter()
+	}
+
+	flags := &strings.Builder{}
+	if c.Options.RelayAddress != models.DEFAULT_RELAY && !c.Options.OnlyLocal {
+		flags.WriteString("--relay " + c.Options.RelayAddress + " ")
+	}
+	if c.Options.RelayPassword != models.DEFAULT_PASSPHRASE {
+		flags.WriteString("--pass " + c.Options.RelayPassword + " ")
+	}
+	webURL := webReceiveURL(c.Options.SharedSecret)
+	output, colorEnabled := presenter.output()
+	fmt.Fprint(output, formatSendInstructions(c.Options.SharedSecret, flags.String(), webURL, colorEnabled))
+	if !c.Options.DisableClipboard && presenter.copyToClipboard != nil {
+		clipboardText := formatClipboardText(c.Options.SharedSecret, flags.String(), c.Options.ExtendedClipboard)
+		presenter.copyToClipboard(clipboardText, c.Options.Quiet, c.Options.ExtendedClipboard)
+	}
+	if c.Options.ShowQrCode && presenter.showQRCode != nil {
+		presenter.showQRCode(webURL)
+	}
+}
 
 func colorSecret(secret string, enabled bool) string {
 	if !enabled {
