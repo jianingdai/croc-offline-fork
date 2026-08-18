@@ -116,6 +116,8 @@ type Options struct {
 	// receiver creates any incoming files or directories. Nil preserves the
 	// interactive CLI approval behavior.
 	ManifestApprover ManifestApprover
+	// EventSink receives structured transfer lifecycle events asynchronously.
+	EventSink EventSink
 }
 
 type SimpleMessage struct {
@@ -189,6 +191,11 @@ type Client struct {
 	longestFilename          int
 	firstSend                bool
 	sendInstructionPresenter sendInstructionPresenter
+	eventMu                  sync.Mutex
+	events                   *eventDispatcher
+	eventTerminalOnce        sync.Once
+	progressMu               sync.Mutex
+	progress                 *progressTracker
 
 	mutex                    *sync.Mutex
 	fread                    *os.File
@@ -608,6 +615,7 @@ func (c *Client) transferWithReconnect(connectAttempt func(attempt int) error) e
 		if attempt > 0 {
 			delay := reconnectBackoff(attempt)
 			log.Debugf("reconnect attempt %d after %s", attempt, delay)
+			c.emitReconnect(attempt)
 			time.Sleep(delay)
 			if err := c.resetForReconnectAttempt(attempt); err != nil {
 				return err
@@ -1423,6 +1431,10 @@ func (c *Client) receiverReconnectRelayAttempt(attempt int) error {
 func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, totalNumberFolders int) (err error) {
 	go c.stop.done()
 	defer c.stop.Cancel()
+	c.emitPhase(TransferPhaseConnecting)
+	defer func() {
+		c.finishTransferEvents(err)
+	}()
 	c.EmptyFoldersToTransfer = emptyFoldersToTransfer
 	c.TotalNumberFolders = totalNumberFolders
 	c.TotalNumberOfContents = len(filesInfo)
@@ -1430,6 +1442,7 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 	if err != nil {
 		return
 	}
+	c.initializeTransferProgress(c.FilesToTransfer)
 	c.presentSendInstructions()
 	if c.Options.Ask {
 		machid, _ := machineid.ID()
@@ -1629,6 +1642,10 @@ func (c *Client) discoverReceivePeers() (discoveries []peerdiscovery.Discovered)
 func (c *Client) Receive() (err error) {
 	go c.stop.done()
 	defer c.stop.Cancel()
+	c.emitPhase(TransferPhaseConnecting)
+	defer func() {
+		c.finishTransferEvents(err)
+	}()
 	output, _ := termui.Output(os.Stderr)
 	fmt.Fprint(output, "connecting...")
 	// recipient will look for peers first
@@ -1903,6 +1920,9 @@ func (c *Client) transfer() (err error) {
 		errc:    make(chan error, 1),
 		control: c.conn[0],
 	}
+	if !c.Step1ChannelSecured {
+		c.emitPhase(TransferPhaseSecuring)
+	}
 
 	// if recipient, initialize with sending pake information
 	log.Debug("ready")
@@ -2061,6 +2081,10 @@ func (c *Client) processMessageFileInfo(m message.Message) (done bool, err error
 		totalSize += file.Size
 	}
 	manifest := newReceiveManifest(filesToTransfer, emptyFoldersToTransfer, totalSize)
+	c.emitManifestReady(manifest)
+	if c.Options.ManifestApprover != nil || !c.Options.NoPrompt || c.Options.Ask || senderInfo.Ask {
+		c.emitPhase(TransferPhaseAwaitingApproval)
+	}
 	if c.Options.ManifestApprover != nil {
 		var decision ManifestDecision
 		decision, err = c.approveReceiveManifest(manifest)
@@ -2142,6 +2166,8 @@ func (c *Client) processMessageFileInfo(m message.Message) (done bool, err error
 	} else {
 		c.printReceiveManifestSummary(totalSize)
 	}
+	c.initializeTransferProgress(c.FilesToTransfer)
+	c.emitPhase(TransferPhaseTransferring)
 	output, _ := termui.Output(os.Stderr)
 	fmt.Fprintf(output, "\nReceiving (<-%s)\n", c.ExternalIPConnected)
 
@@ -2499,6 +2525,7 @@ func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (
 			}
 		}
 	case message.TypeCloseSender:
+		c.completeTransferFileProgress(c.FilesToTransferCurrentNum)
 		c.bar.Finish()
 		log.Debug("close-sender received...")
 		c.Step4FileTransferred = false
@@ -2668,6 +2695,7 @@ func (c *Client) recipientGetFileReady(finished bool) (err error) {
 	})
 	log.Debug("converting to chunk range")
 	c.CurrentFileChunks = utils.ChunkRangesToChunks(c.CurrentFileChunkRanges)
+	c.startTransferFileProgress(c.FilesToTransferCurrentNum, c.CurrentFileChunks)
 
 	if !finished {
 		// setup the progressbar
@@ -2775,6 +2803,8 @@ func (c *Client) createEmptyFileAndFinish(fileInfo FileInfo, i int) (err error) 
 	}
 	c.bar = c.newProgressBar(1, formatDescription(description), 0)
 	c.bar.Finish()
+	c.startTransferFileProgress(i, nil)
+	c.completeTransferFileProgress(i)
 	return
 }
 
@@ -2859,6 +2889,7 @@ func (c *Client) updateIfRecipientHasFileInfo() (err error) {
 			}
 		} else {
 			log.Debugf("received file %d hash verified", i)
+			c.completeTransferFileProgress(i)
 
 			if !fileInfo.ModTime.IsZero() {
 				if err := os.Chtimes(path.Join(fileInfo.FolderRemote, fileInfo.Name), fileInfo.ModTime, fileInfo.ModTime); err != nil {
@@ -2912,6 +2943,8 @@ func (c *Client) updateState(attempt *transferAttemptState) (err error) {
 
 	if c.Options.IsSender && c.Step3RecipientRequestFile && !c.Step4FileTransferred {
 		log.Debug("start sending data!")
+		c.emitPhase(TransferPhaseTransferring)
+		c.startTransferFileProgress(c.FilesToTransferCurrentNum, c.CurrentFileChunks)
 
 		if !c.firstSend {
 			output, _ := termui.Output(os.Stderr)
@@ -3060,10 +3093,12 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
 		c.bar.Add(len(data[8:]))
 		c.TotalSent += int64(len(data[8:]))
 		c.TotalChunksTransferred++
+		c.addTransferFileProgress(c.FilesToTransferCurrentNum, positionInt64, len(data[8:]))
 		// log.Debug(len(c.CurrentFileChunks), c.TotalChunksTransferred, c.TotalSent, c.FilesToTransfer[c.FilesToTransferCurrentNum].Size)
 
 		if !c.CurrentFileIsClosed && (c.TotalChunksTransferred == len(c.CurrentFileChunks) || c.TotalSent == c.FilesToTransfer[c.FilesToTransferCurrentNum].Size) {
 			c.CurrentFileIsClosed = true
+			c.completeTransferFileProgress(c.FilesToTransferCurrentNum)
 			log.Debug("finished receiving!")
 			if err = c.CurrentFile.Close(); err != nil {
 				log.Debugf("error closing %s: %v", c.CurrentFile.Name(), err)
@@ -3165,8 +3200,11 @@ func (c *Client) sendData(i int, dataConn *comm.Comm, fread *os.File, attempt *t
 						}
 						return
 					}
+					c.mutex.Lock()
 					c.bar.Add(n)
 					c.TotalSent += int64(n)
+					c.mutex.Unlock()
+					c.addTransferFileProgress(c.FilesToTransferCurrentNum, int64(pos), n)
 					// time.Sleep(100 * time.Millisecond)
 				}
 			}

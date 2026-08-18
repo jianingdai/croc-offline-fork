@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -61,27 +62,44 @@ func waitForLoopbackListener(t *testing.T, address string) {
 
 func startLoopbackRelay(t *testing.T) loopbackRelay {
 	t.Helper()
+	return startLoopbackRelayWithDataPorts(t, 1)
+}
+
+func startLoopbackRelayWithDataPorts(t *testing.T, dataPortCount int) loopbackRelay {
+	t.Helper()
+	if dataPortCount < 1 {
+		t.Fatal("loopback relay needs at least one data port")
+	}
 	controlPort := unusedLoopbackPort(t)
-	dataPort := unusedLoopbackPort(t)
-	for dataPort == controlPort {
-		dataPort = unusedLoopbackPort(t)
+	dataPorts := make([]string, 0, dataPortCount)
+	usedPorts := map[string]struct{}{controlPort: {}}
+	for len(dataPorts) < dataPortCount {
+		port := unusedLoopbackPort(t)
+		if _, exists := usedPorts[port]; exists {
+			continue
+		}
+		usedPorts[port] = struct{}{}
+		dataPorts = append(dataPorts, port)
 	}
 	password := "test-only-relay-password"
 	ctx, cancel := context.WithCancel(context.Background())
-	serverErrors := make(chan error, 2)
+	serverErrors := make(chan error, dataPortCount+1)
+	for _, dataPort := range dataPorts {
+		dataPort := dataPort
+		go func() {
+			serverErrors <- tcp.RunCtx(ctx, "error", "127.0.0.1", dataPort, password)
+		}()
+		waitForLoopbackListener(t, net.JoinHostPort("127.0.0.1", dataPort))
+	}
 	go func() {
-		serverErrors <- tcp.RunCtx(ctx, "error", "127.0.0.1", dataPort, password)
-	}()
-	waitForLoopbackListener(t, net.JoinHostPort("127.0.0.1", dataPort))
-	go func() {
-		serverErrors <- tcp.RunCtx(ctx, "error", "127.0.0.1", controlPort, password, dataPort)
+		serverErrors <- tcp.RunCtx(ctx, "error", "127.0.0.1", controlPort, password, strings.Join(dataPorts, ","))
 	}()
 	address := net.JoinHostPort("127.0.0.1", controlPort)
 	waitForLoopbackListener(t, address)
 
 	t.Cleanup(func() {
 		cancel()
-		for i := 0; i < 2; i++ {
+		for i := 0; i < dataPortCount+1; i++ {
 			select {
 			case err := <-serverErrors:
 				if err != nil {
