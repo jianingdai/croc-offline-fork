@@ -1027,12 +1027,12 @@ func (c *Client) sendCollectFiles(filesInfo []FileInfo) (err error) {
 		}
 
 		if fileInfo.Mode&os.ModeSymlink != 0 {
-			log.Debugf("%s is symlink", fileInfo.Name)
+			log.Debugf("file %d is a symlink", i)
 			c.FilesToTransfer[i].Symlink, err = os.Readlink(fullPath)
 			if err != nil {
 				log.Debugf("error getting symlink: %s", err.Error())
 			}
-			log.Debugf("%+v", c.FilesToTransfer[i])
+			log.Debugf("collected symlink metadata for file %d", i)
 		}
 
 		if c.Options.HashAlgorithm == "" {
@@ -1040,12 +1040,12 @@ func (c *Client) sendCollectFiles(filesInfo []FileInfo) (err error) {
 		}
 
 		c.FilesToTransfer[i].Hash, err = c.stop.hash(fullPath, c.Options.HashAlgorithm, fileInfo.Size > 1e7)
-		log.Debugf("hashed %s to %x using %s", fullPath, c.FilesToTransfer[i].Hash, c.Options.HashAlgorithm)
+		log.Debugf("hashed file %d (%d bytes) using %s", i, fileInfo.Size, c.Options.HashAlgorithm)
 		totalFilesSize += fileInfo.Size
 		if err != nil {
 			return
 		}
-		log.Debugf("file %d info: %+v", i, c.FilesToTransfer[i])
+		log.Debugf("collected metadata for file %d (%d bytes)", i, fileInfo.Size)
 		fmt.Fprintf(os.Stderr, "\r                                 ")
 		output, _ := termui.Output(os.Stderr)
 		fmt.Fprintf(output, "\rSending %d files (%s)", i, utils.ByteCountDecimal(totalFilesSize))
@@ -1173,7 +1173,7 @@ func (c *Client) transferOverLocalRelay(errchan chan<- error) {
 		} else if bytes.Equal(data, []byte{1}) {
 			log.Trace("got ping")
 		} else {
-			log.Debugf("instead of handshake got: %s", data)
+			log.Debugf("unexpected local relay handshake frame (bytes=%d)", len(data))
 		}
 	}
 	c.setRelayControlAddress(localControlAddress)
@@ -1207,21 +1207,20 @@ func (c *Client) senderWaitForHandshake(conn *comm.Comm) error {
 			log.Tracef("[%+v] had error: %s", conn, errConn.Error())
 			return errConn
 		}
-		json.Unmarshal(data, &dataMessage)
-		log.Tracef("data: %+v '%s'", data, data)
-		log.Tracef("dataMessage: %+v", dataMessage)
+		_ = json.Unmarshal(data, &dataMessage)
+		log.Tracef("local probe frame received (bytes=%d)", len(data))
 		if kB != nil {
 			var decryptErr error
 			var dataDecrypt []byte
 			dataDecrypt, decryptErr = crypt.Decrypt(data, kB)
 			if decryptErr != nil {
-				log.Tracef("error decrypting: %v: '%s'", decryptErr, data)
+				log.Tracef("local probe decryption failed (ciphertext_bytes=%d): %v", len(data), decryptErr)
 				if strings.Contains(decryptErr.Error(), "message authentication failed") {
 					return decryptErr
 				}
 			} else {
 				data = dataDecrypt
-				log.Tracef("decrypted: %s", data)
+				log.Tracef("local probe plaintext decoded (bytes=%d)", len(data))
 			}
 		}
 		if bytes.Equal(data, ipRequest) {
@@ -1235,7 +1234,7 @@ func (c *Client) senderWaitForHandshake(conn *comm.Comm) error {
 				}
 				ips = append([]string{c.localRelayPort}, ips...)
 			}
-			log.Tracef("sending ips: %+v", ips)
+			log.Tracef("sending local address candidates (count=%d)", len(ips))
 			bips, err := json.Marshal(ips)
 			if err != nil {
 				log.Tracef("error marshalling ips: %v", err)
@@ -1308,7 +1307,7 @@ func (c *Client) senderWaitForHandshake(conn *comm.Comm) error {
 			log.Trace("got ping")
 			continue
 		} else {
-			log.Tracef("[%+v] got weird bytes: %+v", conn, data)
+			log.Tracef("unexpected local probe message (bytes=%d)", len(data))
 			return fmt.Errorf("gracefully refusing using the public relay")
 		}
 	}
@@ -1744,7 +1743,7 @@ func (c *Client) Receive() (err error) {
 			}
 			err = json.Unmarshal(data, &dataMessage)
 			if err != nil || dataMessage.Kind != "pake2" {
-				log.Debugf("data: %s", data)
+				log.Debugf("invalid local PAKE response (bytes=%d)", len(data))
 				return fmt.Errorf("dataMessage %s pake failed", ipRequest)
 			}
 			if dataMessage.Version != pakekey.ProtocolVersion {
@@ -1795,7 +1794,7 @@ func (c *Client) Receive() (err error) {
 			if err != nil {
 				return
 			}
-			log.Debugf("ips data: %s", data)
+			log.Debugf("local address response decrypted (bytes=%d)", len(data))
 			if err = json.Unmarshal(data, &ips); err != nil {
 				log.Debugf("ips unmarshal error: %v", err)
 			}
@@ -1805,9 +1804,9 @@ func (c *Client) Receive() (err error) {
 		if len(ips) > 1 {
 			port := ips[0]
 			ips = ips[1:]
-			for _, ip := range ips {
+			for candidateIndex, ip := range ips {
 				ipv4Addr, ipv4Net, errNet := net.ParseCIDR(fmt.Sprintf("%s/24", ip))
-				log.Debugf("ipv4Add4: %+v, ipv4Net: %+v, err: %+v", ipv4Addr, ipv4Net, errNet)
+				log.Debugf("parsed local address candidate %d (valid=%t)", candidateIndex, errNet == nil && ipv4Addr != nil && ipv4Net != nil)
 
 				// For peer-to-peer connectivity within a LAN, the sender and receiver don't need to be on the same subnet.
 				// Even with NAT routers in their respective local networks,
@@ -1936,8 +1935,7 @@ func (c *Client) transfer() (err error) {
 		}
 		done, err = c.processMessage(data, attempt)
 		if err != nil {
-			log.Debugf("data: %s", data)
-			log.Debugf("got error processing: %v", err)
+			log.Debugf("protocol frame processing failed (bytes=%d, error_type=%T)", len(data), err)
 			break
 		}
 		if done {
@@ -1951,7 +1949,7 @@ func (c *Client) transfer() (err error) {
 	// purge errors that come from successful transfer
 	if c.SuccessfulTransfer {
 		if err != nil {
-			log.Debugf("purging error: %s", err)
+			log.Debug("discarding protocol error after successful transfer")
 		}
 		err = nil
 	}
@@ -2181,7 +2179,7 @@ func (c *Client) processMessageFileInfo(m message.Message) (done bool, err error
 			err = errStopTransfer
 		}
 	}
-	log.Debug(c.FilesToTransfer)
+	log.Debugf("received file manifest metadata (files=%d, empty_folders=%d, bytes=%d)", len(c.FilesToTransfer), len(c.EmptyFoldersToTransfer), totalSize)
 	c.Step2FileInfoTransferred = true
 	return
 }
@@ -2392,7 +2390,7 @@ func (c *Client) activateSecureChannel(attempt *transferAttemptState) (err error
 }
 
 func (c *Client) processExternalIP(m message.Message) (done bool, err error) {
-	log.Debugf("received external IP: %+v", m)
+	log.Debugf("received external IP message (address_bytes=%d, payload_bytes=%d)", len(m.Message), len(m.Bytes)+len(m.Bytes2))
 	if c.Options.IsSender {
 		err = message.Send(c.conn[0], c.Key, message.Message{
 			Type:    message.TypeExternalIP,
@@ -2406,7 +2404,7 @@ func (c *Client) processExternalIP(m message.Message) (done bool, err error) {
 		// it can be preset by the local relay
 		c.ExternalIPConnected = m.Message
 	}
-	log.Debugf("connected as %s -> %s", c.ExternalIP, c.ExternalIPConnected)
+	log.Debug("external IP exchange completed")
 	c.Step1ChannelSecured = true
 	return
 }
@@ -2465,7 +2463,7 @@ func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (
 		c.FilesToTransferCurrentNum = remoteFile.FilesToTransferCurrentNum
 		c.CurrentFileChunkRanges = remoteFile.CurrentFileChunkRanges
 		c.CurrentFileChunks = utils.ChunkRangesToChunks(c.CurrentFileChunkRanges)
-		log.Debugf("current file chunks: %+v", c.CurrentFileChunks)
+		log.Debugf("received requested file chunks (count=%d)", len(c.CurrentFileChunks))
 		c.mutex.Lock()
 		c.chunkMap = make(map[uint64]struct{})
 		for _, chunk := range c.CurrentFileChunks {
@@ -2506,12 +2504,12 @@ func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (
 		c.Step3RecipientRequestFile = false
 	}
 	if err != nil {
-		log.Debugf("got error from processing message: %v", err)
+		log.Debugf("message processing failed (error_type=%T)", err)
 		return
 	}
 	err = c.updateState(attempt)
 	if err != nil {
-		log.Debugf("got error from updating state: %v", err)
+		log.Debugf("transfer state update failed (error_type=%T)", err)
 		return
 	}
 	return
@@ -2786,7 +2784,7 @@ func (c *Client) updateIfRecipientHasFileInfo() (err error) {
 		if i < c.FilesToTransferCurrentNum {
 			continue
 		}
-		log.Debugf("checking %+v", fileInfo)
+		log.Debugf("checking received file %d (%d bytes)", i, fileInfo.Size)
 		recipientFileInfo, errRecipientFile := os.Lstat(path.Join(fileInfo.FolderRemote, fileInfo.Name))
 		var errHash error
 		var fileHash []byte
@@ -2803,10 +2801,8 @@ func (c *Client) updateIfRecipientHasFileInfo() (err error) {
 			}
 			continue
 		}
-		log.Debugf("%s %+x %+x %+v", fileInfo.Name, fileHash, fileInfo.Hash, errHash)
 		if !bytes.Equal(fileHash, fileInfo.Hash) {
-			log.Debugf("hashed %s to %x using %s", fileInfo.Name, fileHash, c.Options.HashAlgorithm)
-			log.Debugf("hashes are not equal %x != %x", fileHash, fileInfo.Hash)
+			log.Debugf("received file %d hash differs using %s", i, c.Options.HashAlgorithm)
 			if errHash == nil && errRecipientFile == nil && !strings.HasPrefix(fileInfo.Name, "croc-stdin-") && !c.Options.SendingText && c.Options.Rename {
 				newName := utils.UnusedFilename(fileInfo.FolderRemote, fileInfo.Name)
 				output, colorEnabled := termui.Output(os.Stderr)
@@ -2854,7 +2850,7 @@ func (c *Client) updateIfRecipientHasFileInfo() (err error) {
 				}
 			}
 		} else {
-			log.Debugf("hashes are equal %x == %x", fileHash, fileInfo.Hash)
+			log.Debugf("received file %d hash verified", i)
 
 			if !fileInfo.ModTime.IsZero() {
 				if err := os.Chtimes(path.Join(fileInfo.FolderRemote, fileInfo.Name), fileInfo.ModTime, fileInfo.ModTime); err != nil {

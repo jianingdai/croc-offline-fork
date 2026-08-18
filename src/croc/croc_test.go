@@ -28,6 +28,9 @@ import (
 )
 
 func init() {
+	if os.Getenv(protocolMessageLogProbeEnv) != "" {
+		return
+	}
 	log.SetLevel("trace")
 
 	go tcp.Run("debug", "127.0.0.1", "8281", "pass123", "8282,8283,8284,8285")
