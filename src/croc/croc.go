@@ -112,6 +112,10 @@ type Options struct {
 	// SuppressSendInstructions disables sender share instructions, QR output,
 	// and clipboard integration without suppressing transfer status or logs.
 	SuppressSendInstructions bool
+	// ManifestApprover receives a validated, immutable snapshot before the
+	// receiver creates any incoming files or directories. Nil preserves the
+	// interactive CLI approval behavior.
+	ManifestApprover ManifestApprover
 }
 
 type SimpleMessage struct {
@@ -720,8 +724,16 @@ func validateReceiveMetadata(files []FileInfo, emptyFolders []FileInfo) ([]FileI
 	normalizedFiles := make([]FileInfo, len(files))
 	normalizedEmptyFolders := make([]FileInfo, len(emptyFolders))
 	destinations := make(map[string]struct{}, len(files)+len(emptyFolders))
+	totalSize := int64(0)
 
 	for i, fi := range files {
+		if fi.Size < 0 {
+			return nil, nil, fmt.Errorf("file size must not be negative")
+		}
+		if fi.Size > math.MaxInt64-totalSize {
+			return nil, nil, fmt.Errorf("total file size overflows int64")
+		}
+		totalSize += fi.Size
 		cleanFolder, destination, err := normalizeReceiveFilePath(fi.FolderRemote, fi.Name)
 		if err != nil {
 			return nil, nil, err
@@ -741,6 +753,9 @@ func validateReceiveMetadata(files []FileInfo, emptyFolders []FileInfo) ([]FileI
 	}
 
 	for i, fi := range emptyFolders {
+		if fi.Size < 0 {
+			return nil, nil, fmt.Errorf("folder size must not be negative")
+		}
 		cleanFolder, err := normalizeReceiveFolder(fi.FolderRemote)
 		if err != nil {
 			return nil, nil, err
@@ -2037,16 +2052,41 @@ func (c *Client) processMessageFileInfo(m message.Message) (done bool, err error
 		log.Debug(err)
 		return
 	}
+	filesToTransfer, emptyFoldersToTransfer, err := validateReceiveMetadata(senderInfo.FilesToTransfer, senderInfo.EmptyFoldersToTransfer)
+	if err != nil {
+		return true, err
+	}
+	totalSize := int64(0)
+	for _, file := range filesToTransfer {
+		totalSize += file.Size
+	}
+	manifest := newReceiveManifest(filesToTransfer, emptyFoldersToTransfer, totalSize)
+	if c.Options.ManifestApprover != nil {
+		var decision ManifestDecision
+		decision, err = c.approveReceiveManifest(manifest)
+		if err != nil {
+			return true, err
+		}
+		if decision == ManifestReject {
+			err = message.Send(c.conn[0], c.Key, message.Message{
+				Type:    message.TypeError,
+				Message: "refusing files",
+			})
+			if err != nil {
+				return false, err
+			}
+			return true, fmt.Errorf("refused files")
+		}
+	}
+
 	c.Options.SendingText = senderInfo.SendingText
 	c.Options.NoCompress = senderInfo.NoCompress
 	c.Options.HashAlgorithm = senderInfo.HashAlgorithm
 	c.peerReconnectVersion = senderInfo.ReconnectVersion
 	c.nextReconnectRoom = senderInfo.NextReconnectRoom
 	c.TotalNumberFolders = senderInfo.TotalNumberFolders
-	c.FilesToTransfer, c.EmptyFoldersToTransfer, err = validateReceiveMetadata(senderInfo.FilesToTransfer, senderInfo.EmptyFoldersToTransfer)
-	if err != nil {
-		return true, err
-	}
+	c.FilesToTransfer = filesToTransfer
+	c.EmptyFoldersToTransfer = emptyFoldersToTransfer
 	c.TotalNumberOfContents = 0
 	if c.FilesToTransfer != nil {
 		c.TotalNumberOfContents += len(c.FilesToTransfer)
@@ -2066,16 +2106,7 @@ func (c *Client) processMessageFileInfo(m message.Message) (done bool, err error
 		c.Options.Stdout = true
 	}
 
-	fname := fmt.Sprintf("%d files", len(c.FilesToTransfer))
-	folderName := fmt.Sprintf("%d folders", c.TotalNumberFolders)
-	displayName := ""
-	if len(c.FilesToTransfer) == 1 {
-		displayName = c.FilesToTransfer[0].Name
-		fname = quotedFilename(displayName, false)
-	}
-	totalSize := int64(0)
 	for i, fi := range c.FilesToTransfer {
-		totalSize += fi.Size
 		if len(fi.Name) > c.longestFilename {
 			c.longestFilename = len(fi.Name)
 		}
@@ -2092,32 +2123,13 @@ func (c *Client) processMessageFileInfo(m message.Message) (done bool, err error
 	// 	return true, fmt.Errorf("not enough disk space")
 	// }
 
-	// c.spinner.Stop()
-	action := "Accept"
-	if c.Options.SendingText {
-		action = "Display"
-		fname = "text message"
-		displayName = ""
-	}
-	if !c.Options.NoPrompt || c.Options.Ask || senderInfo.Ask {
-		output, colorEnabled := termui.Output(os.Stderr)
-		if displayName != "" {
-			fname = quotedFilename(displayName, colorEnabled)
+	if c.Options.ManifestApprover == nil {
+		var decision ManifestDecision
+		decision, err = c.promptForManifestApproval(senderInfo, totalSize)
+		if err != nil {
+			return true, err
 		}
-		choicePrompt := termui.Emphasis("(Y/n)", colorEnabled)
-		if c.Options.Ask || senderInfo.Ask {
-			machID, _ := machineid.ID()
-			fmt.Fprintf(output, "\rYour machine id is '%s'.\n%s %s (%s) from '%s'? %s ", machID, action, fname, utils.ByteCountDecimal(totalSize), senderInfo.MachineID, choicePrompt)
-		} else {
-			if c.TotalNumberFolders > 0 {
-				fmt.Fprintf(output, "\r%s %s and %s (%s)? %s ", action, fname, folderName, utils.ByteCountDecimal(totalSize), choicePrompt)
-			} else {
-				fmt.Fprintf(output, "\r%s %s (%s)? %s ", action, fname, utils.ByteCountDecimal(totalSize), choicePrompt)
-			}
-		}
-		choice, errInput := utils.GetInput("")
-		choice = strings.ToLower(choice)
-		if errInput != nil || (choice != "" && choice != "y" && choice != "yes") {
+		if decision == ManifestReject {
 			err = message.Send(c.conn[0], c.Key, message.Message{
 				Type:    message.TypeError,
 				Message: "refusing files",
@@ -2128,11 +2140,7 @@ func (c *Client) processMessageFileInfo(m message.Message) (done bool, err error
 			return true, fmt.Errorf("refused files")
 		}
 	} else {
-		output, colorEnabled := termui.Output(os.Stderr)
-		if displayName != "" {
-			fname = quotedFilename(displayName, colorEnabled)
-		}
-		fmt.Fprintf(output, "\rReceiving %s (%s) \n", fname, utils.ByteCountDecimal(totalSize))
+		c.printReceiveManifestSummary(totalSize)
 	}
 	output, _ := termui.Output(os.Stderr)
 	fmt.Fprintf(output, "\nReceiving (<-%s)\n", c.ExternalIPConnected)
