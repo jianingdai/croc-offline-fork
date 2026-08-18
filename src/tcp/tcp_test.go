@@ -5,6 +5,9 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
+	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +16,122 @@ import (
 	log "github.com/schollz/logger"
 	"github.com/stretchr/testify/assert"
 )
+
+const sensitiveHandshakeLogProbeEnv = "CROC_TCP_SENSITIVE_HANDSHAKE_LOG_PROBE"
+
+func TestSensitiveHandshakeLogs(t *testing.T) {
+	if mode := os.Getenv(sensitiveHandshakeLogProbeEnv); mode != "" {
+		runSensitiveHandshakeLogProbe(t, mode)
+		return
+	}
+
+	tests := []struct {
+		name              string
+		mode              string
+		password          string
+		legacyPasswordLog string
+		room              string
+	}{
+		{
+			name:              "long password",
+			mode:              "long",
+			password:          "long-test-relay-password-9",
+			legacyPasswordLog: "l***9",
+			room:              "test-only-sensitive-room-long",
+		},
+		{
+			name:     "short password",
+			mode:     "short",
+			password: "Q!",
+			room:     "test-only-sensitive-room-short",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			command := exec.Command(os.Args[0], "-test.run=^TestSensitiveHandshakeLogs$")
+			command.Env = append(os.Environ(), sensitiveHandshakeLogProbeEnv+"="+test.mode)
+			output, err := command.CombinedOutput()
+			if err != nil {
+				t.Fatal("isolated sensitive-handshake log probe failed")
+			}
+
+			logs := string(output)
+			forbidden := []string{
+				test.password,
+				test.room,
+				test.room + "-cleanup",
+				"strongkey:",
+				"strong key:",
+				"starting with password",
+				"sending password",
+			}
+			if test.legacyPasswordLog != "" {
+				forbidden = append(forbidden, test.legacyPasswordLog)
+			}
+			for _, value := range forbidden {
+				if strings.Contains(logs, value) {
+					t.Fatal("sensitive handshake logs contained forbidden authentication or room data")
+				}
+			}
+
+			for _, event := range []string{
+				"relay authentication handshake completed",
+				"room admitted first peer",
+				"room admitted second peer",
+				"deleting room",
+				"room cleaned up",
+			} {
+				if !strings.Contains(logs, event) {
+					t.Fatalf("sensitive handshake logs omitted fixed diagnostic event %q", event)
+				}
+			}
+		})
+	}
+}
+
+func runSensitiveHandshakeLogProbe(t *testing.T, mode string) {
+	t.Helper()
+	password, room := sensitiveHandshakeLogProbeValues(t, mode)
+	_, address, stopServer := startConfiguredTestServerWithPassword(t, password, WithLogLevel("trace"))
+
+	first, _, _, err := ConnectToTCPServer(address, password, room)
+	if err != nil {
+		stopServer()
+		t.Fatal("connect first room peer")
+	}
+	second, _, _, err := ConnectToTCPServer(address, password, room)
+	if err != nil {
+		first.Close()
+		stopServer()
+		t.Fatal("connect second room peer")
+	}
+	cleanup, _, _, err := ConnectToTCPServer(address, password, room+"-cleanup")
+	if err != nil {
+		first.Close()
+		second.Close()
+		stopServer()
+		t.Fatal("connect cleanup room peer")
+	}
+
+	first.Close()
+	second.Close()
+	stopServer()
+	cleanup.Close()
+}
+
+func sensitiveHandshakeLogProbeValues(t *testing.T, mode string) (password, room string) {
+	t.Helper()
+	switch mode {
+	case "long":
+		return "long-test-relay-password-9", "test-only-sensitive-room-long"
+	case "short":
+		return "Q!", "test-only-sensitive-room-short"
+	default:
+		t.Fatal("unknown sensitive-handshake log probe mode")
+		return "", ""
+	}
+}
 
 func TestMaxRoomsOpenOption(t *testing.T) {
 	s := newDefaultServer()
@@ -333,6 +452,10 @@ func startTestServer(t *testing.T, maxRoomsOpen int) (string, func()) {
 }
 
 func startConfiguredTestServer(t *testing.T, opts ...serverOptsFunc) (*server, string, func()) {
+	return startConfiguredTestServerWithPassword(t, "pass123", opts...)
+}
+
+func startConfiguredTestServerWithPassword(t *testing.T, password string, opts ...serverOptsFunc) (*server, string, func()) {
 	t.Helper()
 	probe, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -349,7 +472,7 @@ func startConfiguredTestServer(t *testing.T, opts ...serverOptsFunc) (*server, s
 	s := newDefaultServer()
 	s.host = "127.0.0.1"
 	s.port = port
-	s.password = "pass123"
+	s.password = password
 	baseOpts := []serverOptsFunc{WithCtx(ctx), WithLogLevel("error")}
 	for _, opt := range append(baseOpts, opts...) {
 		if err := opt(s); err != nil {

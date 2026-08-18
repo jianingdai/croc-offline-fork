@@ -149,20 +149,8 @@ func Run(debugLevel, host, port, password string, banner ...string) (err error) 
 	return RunWithOptionsAsync(host, port, password, WithBanner(banner...), WithLogLevel(debugLevel))
 }
 
-// Mask our password in logs
-func maskedPassword(password string) (s string) {
-	if len(password) > 2 {
-		s = fmt.Sprintf("%c***%c", password[0], password[len(password)-1])
-	} else {
-		s = password
-	}
-	return
-}
-
 func (s *server) start() (err error) {
 	log.SetLevel(s.debugLevel)
-
-	log.Debugf("starting with password '%s'", maskedPassword(s.password))
 
 	s.rooms.Lock()
 	s.rooms.rooms = make(map[string]roomInfo)
@@ -269,7 +257,6 @@ func (s *server) run() (err error) {
 			handshake, errCommunication := s.clientHandshake(c, handshakeDeadline)
 			releaseHandshake()
 			room := handshake.room
-			log.Debugf("room: %+v", room)
 			log.Debugf("err: %+v", errCommunication)
 			if errCommunication != nil {
 				if netErr, ok := errCommunication.(net.Error); ok && netErr.Timeout() {
@@ -285,6 +272,7 @@ func (s *server) run() (err error) {
 				connection.Close()
 				return
 			}
+			log.Debug("relay authentication handshake completed")
 			if err := connection.SetDeadline(time.Time{}); err != nil {
 				log.Debugf("relay-%s: failed to clear handshake deadline: %v", connection.RemoteAddr().String(), err)
 				connection.Close()
@@ -300,7 +288,7 @@ func (s *server) run() (err error) {
 			defer ticker.Stop()
 			for {
 				// check connection
-				log.Tracef("checking connection of room %s for %+v", room, c)
+				log.Trace("checking waiting room connection")
 				deleteIt := false
 				s.rooms.Lock()
 				roomData, ok := s.rooms.rooms[room]
@@ -309,7 +297,7 @@ func (s *server) run() (err error) {
 					s.rooms.Unlock()
 					return
 				}
-				log.Tracef("room: %+v", roomData)
+				log.Trace("checking room readiness")
 				if roomData.first != nil && roomData.second != nil {
 					log.Debug("rooms ready")
 					s.rooms.Unlock()
@@ -375,7 +363,6 @@ func (s *server) deleteOldRooms() {
 		}
 		for _, room := range roomsToDelete {
 			s.deleteRoom(room)
-			log.Debugf("room cleaned up: %s", room)
 		}
 	}
 }
@@ -424,8 +411,6 @@ func (s *server) clientHandshake(c *comm.Comm, deadline time.Time) (result hands
 	if err != nil {
 		return
 	}
-	log.Debugf("strongkey: %x", strongKey)
-
 	// receive salt
 	salt, err := c.ReceiveWithDeadline(deadline)
 	if err != nil {
@@ -494,7 +479,7 @@ func (s *server) clientCommunication(c *comm.Comm, handshake handshakeResult) (r
 
 	admission := s.admitToRoom(room, c)
 	if admission.evicted {
-		log.Debugf("evicting oldest waiting room at capacity: %s", admission.evictedRoom)
+		log.Debug("evicting oldest waiting room at capacity")
 		if admission.evictedConnection != nil {
 			admission.evictedConnection.Close()
 		}
@@ -514,7 +499,7 @@ func (s *server) clientCommunication(c *comm.Comm, handshake handshakeResult) (r
 			s.deleteRoom(room)
 			return
 		}
-		log.Debugf("room %s has 1", room)
+		log.Debug("room admitted first peer")
 		return
 	}
 	if admission.full {
@@ -529,7 +514,7 @@ func (s *server) clientCommunication(c *comm.Comm, handshake handshakeResult) (r
 		}
 		return
 	}
-	log.Debugf("room %s has 2", room)
+	log.Debug("room admitted second peer")
 	otherConnection := admission.otherConnection
 
 	// second connection is the sender, time to staple connections
@@ -568,7 +553,7 @@ func (s *server) deleteRoom(room string) {
 	if !ok {
 		return
 	}
-	log.Debugf("deleting room: %s", room)
+	log.Debug("deleting room")
 	if roomData.first != nil {
 		roomData.first.Close()
 	}
@@ -576,6 +561,7 @@ func (s *server) deleteRoom(room string) {
 		roomData.second.Close()
 	}
 	delete(s.rooms.rooms, room)
+	log.Debug("room cleaned up")
 }
 
 // chanFromConn creates a channel from a Conn object, and sends everything it
@@ -707,8 +693,6 @@ func ConnectToTCPServer(address, password, room string, timelimit ...time.Durati
 		log.Debug(err)
 		return
 	}
-	log.Debugf("strong key: %x", strongKey)
-
 	strongKeyForEncryption, salt, err := crypt.New(strongKey, nil)
 	if err != nil {
 		log.Debug(err)
@@ -721,7 +705,6 @@ func ConnectToTCPServer(address, password, room string, timelimit ...time.Durati
 		return
 	}
 
-	log.Debugf("sending password '%s'", maskedPassword(password))
 	bSend, err := crypt.Encrypt([]byte(password), strongKeyForEncryption)
 	if err != nil {
 		log.Debug(err)
@@ -750,7 +733,7 @@ func ConnectToTCPServer(address, password, room string, timelimit ...time.Durati
 	}
 	banner = strings.Split(string(data), "|||")[0]
 	ipaddr = strings.Split(string(data), "|||")[1]
-	log.Debugf("sending room; %s", room)
+	log.Debug("sending room identifier")
 	bSend, err = crypt.Encrypt([]byte(room), strongKeyForEncryption)
 	if err != nil {
 		log.Debug(err)
