@@ -2,6 +2,7 @@ package comm
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/magisterquis/connectproxy"
@@ -32,10 +34,26 @@ const messageBodyReadTimeout = 10 * time.Minute
 // Comm is some basic TCP communication
 type Comm struct {
 	connection net.Conn
+	ctx        context.Context
+	closeOnce  sync.Once
+	afterMu    sync.Mutex
+	stopAfter  func() bool
+	closed     bool
 }
 
 // NewConnection gets a new comm to a tcp address
 func NewConnection(address string, timelimit ...time.Duration) (c *Comm, err error) {
+	return NewConnectionContext(context.Background(), address, timelimit...)
+}
+
+// NewConnectionContext gets a new context-bound comm to a TCP address.
+func NewConnectionContext(ctx context.Context, address string, timelimit ...time.Duration) (c *Comm, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
 	tlimit := 30 * time.Second
 	if len(timelimit) > 0 {
 		tlimit = timelimit[0]
@@ -44,10 +62,11 @@ func NewConnection(address string, timelimit ...time.Duration) (c *Comm, err err
 	if Socks5Proxy != "" && !utils.IsLocalIP(address) {
 		var dialer proxy.Dialer
 		// prepend schema if no schema is given
-		if !strings.Contains(Socks5Proxy, `://`) {
-			Socks5Proxy = `socks5://` + Socks5Proxy
+		socks5Proxy := Socks5Proxy
+		if !strings.Contains(socks5Proxy, `://`) {
+			socks5Proxy = `socks5://` + socks5Proxy
 		}
-		socks5ProxyURL, urlParseError := url.Parse(Socks5Proxy)
+		socks5ProxyURL, urlParseError := url.Parse(socks5Proxy)
 		if urlParseError != nil {
 			err = fmt.Errorf("unable to parse socks proxy url: %s", urlParseError)
 			log.Debug(err)
@@ -60,14 +79,19 @@ func NewConnection(address string, timelimit ...time.Duration) (c *Comm, err err
 			return
 		}
 		log.Debug("dialing with dialer.Dial")
-		connection, err = dialer.Dial("tcp", address)
+		if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
+			connection, err = contextDialer.DialContext(ctx, "tcp", address)
+		} else {
+			connection, err = dialer.Dial("tcp", address)
+		}
 	} else if HttpProxy != "" && !utils.IsLocalIP(address) {
 		var dialer proxy.Dialer
 		// prepend schema if no schema is given
-		if !strings.Contains(HttpProxy, `://`) {
-			HttpProxy = `http://` + HttpProxy
+		httpProxy := HttpProxy
+		if !strings.Contains(httpProxy, `://`) {
+			httpProxy = `http://` + httpProxy
 		}
-		HttpProxyURL, urlParseError := url.Parse(HttpProxy)
+		HttpProxyURL, urlParseError := url.Parse(httpProxy)
 		if urlParseError != nil {
 			err = fmt.Errorf("unable to parse http proxy url: %s", urlParseError)
 			log.Debug(err)
@@ -80,24 +104,45 @@ func NewConnection(address string, timelimit ...time.Duration) (c *Comm, err err
 			return
 		}
 		log.Debug("dialing with dialer.Dial")
-		connection, err = dialer.Dial("tcp", address)
+		if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
+			connection, err = contextDialer.DialContext(ctx, "tcp", address)
+		} else {
+			// The legacy CONNECT proxy dialer has no context API. Keep its
+			// established behavior while still honoring cancellation before
+			// and immediately after the dial.
+			connection, err = dialer.Dial("tcp", address)
+		}
 
 	} else {
 		log.Debugf("dialing to %s with timelimit %s", address, tlimit)
-		connection, err = net.DialTimeout("tcp", address, tlimit)
+		dialer := net.Dialer{Timeout: tlimit}
+		connection, err = dialer.DialContext(ctx, "tcp", address)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if connection != nil {
+			_ = connection.Close()
+		}
+		return nil, ctxErr
 	}
 	if err != nil {
 		err = fmt.Errorf("comm.NewConnection failed: %w", err)
 		log.Debug(err)
 		return
 	}
-	c = New(connection)
+	c = newContextComm(ctx, connection)
 	log.Debugf("connected to '%s'", address)
 	return
 }
 
 // New returns a new comm
 func New(c net.Conn) *Comm {
+	return newContextComm(context.Background(), c)
+}
+
+func newContextComm(ctx context.Context, c net.Conn) *Comm {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := c.SetReadDeadline(time.Now().Add(3 * time.Hour)); err != nil {
 		log.Warnf("error setting read deadline: %v", err)
 	}
@@ -107,8 +152,18 @@ func New(c net.Conn) *Comm {
 	if err := c.SetWriteDeadline(time.Now().Add(3 * time.Hour)); err != nil {
 		log.Errorf("error setting write deadline: %v", err)
 	}
-	comm := new(Comm)
-	comm.connection = c
+	comm := &Comm{connection: c, ctx: ctx}
+	if ctx.Done() != nil {
+		stopAfter := context.AfterFunc(ctx, comm.Close)
+		comm.afterMu.Lock()
+		if comm.closed {
+			comm.afterMu.Unlock()
+			stopAfter()
+		} else {
+			comm.stopAfter = stopAfter
+			comm.afterMu.Unlock()
+		}
+	}
 	return comm
 }
 
@@ -119,12 +174,31 @@ func (c *Comm) Connection() net.Conn {
 
 // Close closes the connection
 func (c *Comm) Close() {
-	if err := c.connection.Close(); err != nil {
-		if errors.Is(err, net.ErrClosed) {
-			return
-		}
-		log.Warnf("error closing connection: %v", err)
+	if c == nil {
+		return
 	}
+	c.closeOnce.Do(func() {
+		c.afterMu.Lock()
+		c.closed = true
+		stopAfter := c.stopAfter
+		c.stopAfter = nil
+		c.afterMu.Unlock()
+		if stopAfter != nil {
+			stopAfter()
+		}
+		if err := c.connection.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Warnf("error closing connection: %v", err)
+		}
+	})
+}
+
+func (c *Comm) contextError(err error) error {
+	if err != nil && c.ctx != nil {
+		if ctxErr := c.ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+	}
+	return err
 }
 
 func (c *Comm) Write(b []byte) (n int, err error) {
@@ -137,7 +211,10 @@ func (c *Comm) Write(b []byte) (n int, err error) {
 	tmpCopy = append(MAGIC_BYTES, tmpCopy...)
 	n, err = c.connection.Write(tmpCopy)
 	if err != nil {
-		err = fmt.Errorf("connection.Write failed: %w", err)
+		err = c.contextError(err)
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			err = fmt.Errorf("connection.Write failed: %w", err)
+		}
 		return
 	}
 	if n != len(tmpCopy) {
@@ -156,10 +233,18 @@ func (c *Comm) readWithDeadline(readDeadline time.Time) (buf []byte, numBytes in
 	// read. The previous ordering cleared the read deadline immediately after
 	// setting it, leaving header reads unbounded.
 	if err = c.connection.SetDeadline(time.Time{}); err != nil {
+		err = c.contextError(err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
 		err = fmt.Errorf("failed to clear deadline: %w", err)
 		return
 	}
 	if err = c.connection.SetReadDeadline(readDeadline); err != nil {
+		err = c.contextError(err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
 		err = fmt.Errorf("error setting read deadline: %w", err)
 		return
 	}
@@ -168,6 +253,7 @@ func (c *Comm) readWithDeadline(readDeadline time.Time) (buf []byte, numBytes in
 	header := make([]byte, 4)
 	_, err = io.ReadFull(c.connection, header)
 	if err != nil {
+		err = c.contextError(err)
 		log.Debugf("initial read error: %v", err)
 		return
 	}
@@ -180,6 +266,7 @@ func (c *Comm) readWithDeadline(readDeadline time.Time) (buf []byte, numBytes in
 	header = make([]byte, 4)
 	_, err = io.ReadFull(c.connection, header)
 	if err != nil {
+		err = c.contextError(err)
 		log.Debugf("initial read error: %v", err)
 		return
 	}
@@ -206,12 +293,17 @@ func (c *Comm) readWithDeadline(readDeadline time.Time) (buf []byte, numBytes in
 		bodyReadDeadline = readDeadline
 	}
 	if err = c.connection.SetReadDeadline(bodyReadDeadline); err != nil {
+		err = c.contextError(err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
 		err = fmt.Errorf("error setting message body read deadline: %w", err)
 		return
 	}
 	buf = make([]byte, numBytes)
 	_, err = io.ReadFull(c.connection, buf)
 	if err != nil {
+		err = c.contextError(err)
 		log.Debugf("consecutive read error: %v", err)
 		return
 	}

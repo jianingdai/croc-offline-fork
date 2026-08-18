@@ -199,11 +199,12 @@ func (s *server) run() (err error) {
 	}
 	log.Infof("starting TCP server on %s", addr)
 	lc := net.ListenConfig{}
-	s.stop.server, err = lc.Listen(s.stop.ctx, network, addr)
+	listener, err := lc.Listen(s.stop.ctx, network, addr)
 	if err != nil {
 		return fmt.Errorf("error listening on %s: %w", addr, err)
 	}
-	defer s.stop.server.Close()
+	s.stop.setServer(listener)
+	defer listener.Close()
 	close(s.started)
 
 	go func() {
@@ -221,7 +222,7 @@ func (s *server) run() (err error) {
 
 	// spawn a new goroutine whenever a client connects
 	for {
-		connection, err := s.stop.server.Accept()
+		connection, err := listener.Accept()
 		if err != nil {
 			return fmt.Errorf("problem accepting connection: %w", err)
 		}
@@ -348,11 +349,7 @@ func (s *server) deleteOldRooms() {
 			}
 			s.rooms.Unlock()
 		case <-s.stop.ctx.Done():
-			if s.server != nil {
-				log.Debugf("stop TCP server on %s", s.server.Addr())
-				s.server.Close()
-				time.Sleep(time.Millisecond)
-			}
+			s.stop.closeServer()
 			log.Debug("stop room cleanup fired")
 			s.rooms.Lock()
 			for room := range s.rooms.rooms {
@@ -567,13 +564,14 @@ func (s *server) deleteRoom(room string) {
 // chanFromConn creates a channel from a Conn object, and sends everything it
 //
 //	Read()s from the socket to the channel.
-func chanFromConn(conn net.Conn) chan []byte {
+func chanFromConn(conn net.Conn, done <-chan struct{}) <-chan []byte {
 	c := make(chan []byte, 1)
 	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Hour)); err != nil {
 		log.Warnf("can't set read deadline: %v", err)
 	}
 
 	go func() {
+		defer close(c)
 		b := make([]byte, models.TCP_BUFFER_SIZE)
 		for {
 			n, err := conn.Read(b)
@@ -581,12 +579,15 @@ func chanFromConn(conn net.Conn) chan []byte {
 				res := make([]byte, n)
 				// Copy the buffer so it doesn't get changed while read by the recipient.
 				copy(res, b[:n])
-				c <- res
+				select {
+				case c <- res:
+				case <-done:
+					return
+				}
 			}
 			if err != nil {
 				log.Debug(err)
-				c <- nil
-				break
+				return
 			}
 		}
 		log.Debug("exiting")
@@ -598,37 +599,52 @@ func chanFromConn(conn net.Conn) chan []byte {
 // pipe creates a full-duplex pipe between the two sockets and
 // transfers data from one to the other.
 func pipe(conn1 net.Conn, conn2 net.Conn) {
-	chan1 := chanFromConn(conn1)
-	chan2 := chanFromConn(conn2)
+	done := make(chan struct{})
+	defer close(done)
+	defer conn1.Close()
+	defer conn2.Close()
+	chan1 := chanFromConn(conn1, done)
+	chan2 := chanFromConn(conn2, done)
 
 	for {
 		select {
-		case b1 := <-chan1:
-			if b1 == nil {
+		case b1, ok := <-chan1:
+			if !ok {
 				return
 			}
 			if _, err := conn2.Write(b1); err != nil {
 				log.Errorf("write error on channel 1: %v", err)
+				return
 			}
 
-		case b2 := <-chan2:
-			if b2 == nil {
+		case b2, ok := <-chan2:
+			if !ok {
 				return
 			}
 			if _, err := conn1.Write(b2); err != nil {
 				log.Errorf("write error on channel 2: %v", err)
+				return
 			}
 		}
 	}
 }
 
 func PingServer(address string) (err error) {
+	return PingServerContext(context.Background(), address)
+}
+
+// PingServerContext checks a relay endpoint and closes the probe on context cancellation.
+func PingServerContext(ctx context.Context, address string) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	log.Debugf("pinging %s", address)
-	c, err := comm.NewConnection(address, 300*time.Millisecond)
+	c, err := comm.NewConnectionContext(ctx, address, 300*time.Millisecond)
 	if err != nil {
 		log.Debug(err)
-		return
+		return contextResult(ctx, err)
 	}
+	defer c.Close()
 	err = c.Send([]byte("ping"))
 	if err != nil {
 		log.Debug(err)
@@ -650,6 +666,27 @@ var resolveDefaultRelay = models.ResolveDefaultRelay
 // ConnectToTCPServer will initiate a new connection
 // to the specified address, room with optional time limit
 func ConnectToTCPServer(address, password, room string, timelimit ...time.Duration) (c *comm.Comm, banner string, ipaddr string, err error) {
+	return ConnectToTCPServerContext(context.Background(), address, password, room, timelimit...)
+}
+
+// ConnectToTCPServerContext connects to and authenticates with a relay while
+// binding the dial and handshake lifecycle to ctx.
+func ConnectToTCPServerContext(ctx context.Context, address, password, room string, timelimit ...time.Duration) (c *comm.Comm, banner string, ipaddr string, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	defer func() {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
+		if err != nil && c != nil {
+			c.Close()
+			c = nil
+		}
+	}()
+	if err = ctx.Err(); err != nil {
+		return
+	}
 	if models.IsDefaultRelay(address) {
 		address, err = resolveDefaultRelay(address)
 		if err != nil {
@@ -658,9 +695,9 @@ func ConnectToTCPServer(address, password, room string, timelimit ...time.Durati
 		}
 	}
 	if len(timelimit) > 0 {
-		c, err = comm.NewConnection(address, timelimit[0])
+		c, err = comm.NewConnectionContext(ctx, address, timelimit[0])
 	} else {
-		c, err = comm.NewConnection(address)
+		c, err = comm.NewConnectionContext(ctx, address)
 	}
 	if err != nil {
 		log.Debug(err)
@@ -762,4 +799,13 @@ func ConnectToTCPServer(address, password, room string, timelimit ...time.Durati
 	}
 	log.Debug("all set")
 	return
+}
+
+func contextResult(ctx context.Context, err error) error {
+	if ctx != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+	}
+	return err
 }

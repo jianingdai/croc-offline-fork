@@ -3,6 +3,7 @@ package tcp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -12,10 +13,115 @@ import (
 	"testing"
 	"time"
 
+	"github.com/schollz/croc/v10/src/comm"
 	"github.com/schollz/croc/v10/src/models"
 	log "github.com/schollz/logger"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestConnectToTCPServerContextCancelClosesHandshake(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	requestSeen := make(chan struct{})
+	peerClosed := make(chan struct{})
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		peer := comm.New(connection)
+		if _, receiveErr := peer.Receive(); receiveErr != nil {
+			return
+		}
+		close(requestSeen)
+		_, _ = peer.Receive()
+		close(peerClosed)
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, _, _, connectErr := ConnectToTCPServerContext(ctx, listener.Addr().String(), "test-only-password", "test-only-room")
+		result <- connectErr
+	}()
+	select {
+	case <-requestSeen:
+	case <-time.After(time.Second):
+		t.Fatal("fake relay did not receive PAKE request")
+	}
+	started := time.Now()
+	cancel()
+	select {
+	case connectErr := <-result:
+		if !errors.Is(connectErr, context.Canceled) {
+			t.Fatal("relay handshake did not return context cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("relay handshake did not stop after cancellation")
+	}
+	if time.Since(started) > time.Second {
+		t.Fatal("relay handshake cancellation exceeded one second")
+	}
+	select {
+	case <-peerClosed:
+	case <-time.After(time.Second):
+		t.Fatal("fake relay did not observe handshake socket closure")
+	}
+}
+
+func TestPingServerContextCancelClosesProbe(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	pingSeen := make(chan struct{})
+	peerClosed := make(chan struct{})
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		peer := comm.New(connection)
+		payload, receiveErr := peer.Receive()
+		if receiveErr != nil || !bytes.Equal(payload, []byte("ping")) {
+			return
+		}
+		close(pingSeen)
+		_, _ = peer.Receive()
+		close(peerClosed)
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- PingServerContext(ctx, listener.Addr().String())
+	}()
+	select {
+	case <-pingSeen:
+	case <-time.After(time.Second):
+		t.Fatal("fake relay did not receive ping")
+	}
+	cancel()
+	select {
+	case pingErr := <-result:
+		if !errors.Is(pingErr, context.Canceled) {
+			t.Fatal("ping did not return context cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ping did not stop after cancellation")
+	}
+	select {
+	case <-peerClosed:
+	case <-time.After(time.Second):
+		t.Fatal("fake relay did not observe probe socket closure")
+	}
+}
 
 const sensitiveHandshakeLogProbeEnv = "CROC_TCP_SENSITIVE_HANDSHAKE_LOG_PROBE"
 

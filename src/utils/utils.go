@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/flate"
+	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
@@ -12,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -357,74 +357,8 @@ func ByteCountDecimal(b int64) string {
 // If file doesn't exist, it returns an empty chunk list (all chunks).
 // If the file size is not the same as requested, it returns an empty chunk list (all chunks).
 func MissingChunks(fname string, fsize int64, chunkSize int) (chunkRanges []int64) {
-	f, err := os.Open(fname)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-
-	fstat, err := os.Stat(fname)
-	if err != nil || fstat.Size() != fsize {
-		return
-	}
-
-	// Show progress bar for large files (> 10MB)
-	var bar *progressbar.ProgressBar
-	showProgress := fsize > 10*1024*1024
-	if showProgress {
-		fnameShort := shortenProgressFilename(fname)
-		bar = progressbar.NewOptions64(fsize,
-			progressbar.OptionSetWriter(os.Stderr),
-			progressbar.OptionShowBytes(true),
-			progressbar.OptionSetDescription(fmt.Sprintf("Checking %s", fnameShort)),
-			progressbar.OptionClearOnFinish(),
-			progressbar.OptionFullWidth(),
-			progressbar.OptionThrottle(100*time.Millisecond),
-		)
-	}
-
-	emptyBuffer := make([]byte, chunkSize)
-	chunkNum := 0
-	chunks := make([]int64, int64(math.Ceil(float64(fsize)/float64(chunkSize))))
-	var currentLocation int64
-	for {
-		buffer := make([]byte, chunkSize)
-		bytesread, err := f.Read(buffer)
-		if err != nil {
-			break
-		}
-		if bytes.Equal(buffer[:bytesread], emptyBuffer[:bytesread]) {
-			chunks[chunkNum] = currentLocation
-			chunkNum++
-		}
-		currentLocation += int64(bytesread)
-		if showProgress && bar != nil {
-			bar.Add(bytesread)
-		}
-	}
-	if showProgress && bar != nil {
-		bar.Finish()
-	}
-	if chunkNum == 0 {
-		chunkRanges = []int64{}
-	} else {
-		chunks = chunks[:chunkNum]
-		chunkRanges = []int64{int64(chunkSize), chunks[0]}
-		curCount := 0
-		for i, chunk := range chunks {
-			if i == 0 {
-				continue
-			}
-			curCount++
-			if chunk-chunks[i-1] > int64(chunkSize) {
-				chunkRanges = append(chunkRanges, int64(curCount))
-				chunkRanges = append(chunkRanges, chunk)
-				curCount = 0
-			}
-		}
-		chunkRanges = append(chunkRanges, int64(curCount+1))
-	}
-	return
+	chunkRanges, _ = MissingChunksCtx(context.Background(), fname, fsize, chunkSize)
+	return chunkRanges
 }
 
 // ChunkRangesToChunks converts chunk ranges to list

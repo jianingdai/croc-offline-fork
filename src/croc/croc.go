@@ -560,12 +560,13 @@ func (c *Client) closeAttempt() {
 		}
 		c.CurrentFileIsClosed = true
 	}
+	fread := c.fread
+	c.fread = nil
 	c.mutex.Unlock()
-	if c.fread != nil {
-		if err := c.fread.Close(); err != nil {
+	if fread != nil {
+		if err := fread.Close(); err != nil {
 			log.Tracef("closing current send file: %v", err)
 		}
-		c.fread = nil
 	}
 }
 
@@ -612,16 +613,24 @@ func (c *Client) transferWithReconnect(connectAttempt func(attempt int) error) e
 	var lastErr error
 	var lastDisconnectErr error
 	for attempt := 0; attempt <= maxReconnectAttempts; attempt++ {
+		if err := c.ctxErr(); err != nil {
+			return err
+		}
 		if attempt > 0 {
 			delay := reconnectBackoff(attempt)
 			log.Debugf("reconnect attempt %d after %s", attempt, delay)
 			c.emitReconnect(attempt)
-			time.Sleep(delay)
+			if err := utils.WaitContext(c.stop.ctx, delay); err != nil {
+				return err
+			}
 			if err := c.resetForReconnectAttempt(attempt); err != nil {
 				return err
 			}
 		}
 		if err := connectAttempt(attempt); err != nil {
+			if ctxErr := c.ctxErr(); ctxErr != nil {
+				return ctxErr
+			}
 			if attempt > 0 && lastDisconnectErr != nil {
 				return fmt.Errorf("%w (reconnect attempt %d failed: %v)", lastDisconnectErr, attempt, err)
 			}
@@ -1168,7 +1177,10 @@ func (c *Client) broadcastOnLocalNetwork(useipv6 bool) {
 }
 
 func (c *Client) transferOverLocalRelay(errchan chan<- error) {
-	time.Sleep(500 * time.Millisecond)
+	if err := utils.WaitContext(c.stop.ctx, 500*time.Millisecond); err != nil {
+		errchan <- err
+		return
+	}
 	log.Debug("establishing connection")
 	if !c.Options.OnlyLocal {
 		c.rememberReconnectRelayAddress(c.Options.RelayAddress)
@@ -1176,7 +1188,7 @@ func (c *Client) transferOverLocalRelay(errchan chan<- error) {
 	}
 	localControlAddress := "127.0.0.1:" + c.localRelayPort
 	var banner string
-	conn, banner, ipaddr, err := tcp.ConnectToTCPServer(localControlAddress, c.Options.RelayPassword, c.Options.RoomName)
+	conn, banner, ipaddr, err := tcp.ConnectToTCPServerContext(c.stop.ctx, localControlAddress, c.Options.RelayPassword, c.Options.RoomName)
 	log.Debugf("banner: %s", banner)
 	if err != nil {
 		err = fmt.Errorf("could not connect to 127.0.0.1:%s: %w", c.localRelayPort, err)
@@ -1190,7 +1202,15 @@ func (c *Client) transferOverLocalRelay(errchan chan<- error) {
 			errchan <- err
 			return
 		}
-		data, _ := conn.Receive()
+		data, receiveErr := conn.Receive()
+		if receiveErr != nil {
+			if ctxErr := c.ctxErr(); ctxErr != nil {
+				errchan <- ctxErr
+			} else {
+				errchan <- receiveErr
+			}
+			return
+		}
 		if bytes.Equal(data, handshakeRequest) {
 			break
 		} else if bytes.Equal(data, []byte{1}) {
@@ -1379,8 +1399,14 @@ func (c *Client) reconnectRelayAttempt(handshake func(*comm.Comm) error) error {
 	}
 	var reconnectErrors []string
 	for _, address := range candidates {
-		conn, banner, ipaddr, err := tcp.ConnectToTCPServer(address, c.Options.RelayPassword, room)
+		if ctxErr := c.ctxErr(); ctxErr != nil {
+			return ctxErr
+		}
+		conn, banner, ipaddr, err := tcp.ConnectToTCPServerContext(c.stop.ctx, address, c.Options.RelayPassword, room)
 		if err != nil {
+			if ctxErr := c.ctxErr(); ctxErr != nil {
+				return ctxErr
+			}
 			reconnectErrors = append(reconnectErrors, fmt.Sprintf("%s: %v", address, err))
 			continue
 		}
@@ -1388,15 +1414,25 @@ func (c *Client) reconnectRelayAttempt(handshake func(*comm.Comm) error) error {
 		go func() {
 			errc <- handshake(conn)
 		}()
+		timer := time.NewTimer(reconnectCandidateHandshakeTimeout)
 		select {
 		case err = <-errc:
-		case <-time.After(reconnectCandidateHandshakeTimeout):
+		case <-timer.C:
 			err = fmt.Errorf("timed out waiting for reconnect handshake")
 		case <-c.stop.ctx.Done():
 			err = c.stop.ctx.Err()
 		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
 		if err != nil {
 			conn.Close()
+			if ctxErr := c.ctxErr(); ctxErr != nil {
+				return ctxErr
+			}
 			reconnectErrors = append(reconnectErrors, fmt.Sprintf("%s: %v", address, err))
 			continue
 		}
@@ -1430,9 +1466,15 @@ func (c *Client) receiverReconnectRelayAttempt(attempt int) error {
 // Send will send the specified file
 func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, totalNumberFolders int) (err error) {
 	go c.stop.done()
-	defer c.stop.Cancel()
+	defer func() {
+		c.stop.Cancel()
+		c.closeAttempt()
+	}()
 	c.emitPhase(TransferPhaseConnecting)
 	defer func() {
+		if ctxErr := c.stop.parentErr(); ctxErr != nil && !c.SuccessfulTransfer {
+			err = ctxErr
+		}
 		c.finishTransferEvents(err)
 	}()
 	c.EmptyFoldersToTransfer = emptyFoldersToTransfer
@@ -1469,6 +1511,7 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 		go func() {
 			var ipaddr, banner string
 			var conn *comm.Comm
+			var connectErr error
 			var selectedAddress string
 			durations := []time.Duration{100 * time.Millisecond, 5 * time.Second}
 			for i, address := range []string{c.Options.RelayAddress6, c.Options.RelayAddress} {
@@ -1485,26 +1528,26 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 				log.Debugf("got host '%v' and port '%v'", host, port)
 				address = net.JoinHostPort(host, port)
 				log.Debugf("trying connection to %s", address)
-				conn, banner, ipaddr, err = tcp.ConnectToTCPServer(address, c.Options.RelayPassword, c.Options.RoomName, durations[i])
-				if err == nil {
+				conn, banner, ipaddr, connectErr = tcp.ConnectToTCPServerContext(c.stop.ctx, address, c.Options.RelayPassword, c.Options.RoomName, durations[i])
+				if connectErr == nil {
 					selectedAddress = address
 					break
 				}
 				log.Debugf("could not establish '%s'", address)
 			}
-			if conn == nil && err == nil {
-				err = fmt.Errorf("could not connect")
+			if conn == nil && connectErr == nil {
+				connectErr = fmt.Errorf("could not connect")
 			}
-			if err != nil {
-				err = fmt.Errorf("could not connect to %s: %w", c.Options.RelayAddress, err)
-				log.Debug(err)
-				errchan <- err
+			if connectErr != nil {
+				connectErr = fmt.Errorf("could not connect to %s: %w", c.Options.RelayAddress, connectErr)
+				log.Debug(connectErr)
+				errchan <- connectErr
 				return
 			}
 			log.Debugf("banner: %s", banner)
 			log.Debugf("connection established: %+v", conn)
-			if err = c.senderWaitForHandshake(conn); err != nil {
-				errchan <- err
+			if handshakeErr := c.senderWaitForHandshake(conn); handshakeErr != nil {
+				errchan <- handshakeErr
 				return
 			}
 
@@ -1527,7 +1570,11 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 		}()
 	}
 
-	err = <-errchan
+	select {
+	case err = <-errchan:
+	case <-c.stop.parent.Done():
+		err = c.stop.parent.Err()
+	}
 	if err == nil {
 		return // no error
 	} else {
@@ -1641,9 +1688,15 @@ func (c *Client) discoverReceivePeers() (discoveries []peerdiscovery.Discovered)
 // Receive will receive a file
 func (c *Client) Receive() (err error) {
 	go c.stop.done()
-	defer c.stop.Cancel()
+	defer func() {
+		c.stop.Cancel()
+		c.closeAttempt()
+	}()
 	c.emitPhase(TransferPhaseConnecting)
 	defer func() {
+		if ctxErr := c.stop.parentErr(); ctxErr != nil && !c.SuccessfulTransfer {
+			err = ctxErr
+		}
 		c.finishTransferEvents(err)
 	}()
 	output, _ := termui.Output(os.Stderr)
@@ -1689,7 +1742,7 @@ func (c *Client) Receive() (err error) {
 					portToUse = models.DEFAULT_PORT
 				}
 				address := net.JoinHostPort(discoveries[i].Address, portToUse)
-				errPing := tcp.PingServer(address)
+				errPing := tcp.PingServerContext(c.stop.ctx, address)
 				if errPing == nil {
 					log.Debugf("successfully pinged '%s'", address)
 					c.Options.RelayAddress = address
@@ -1722,7 +1775,7 @@ func (c *Client) Receive() (err error) {
 		log.Debugf("got host '%v' and port '%v'", host, port)
 		address = net.JoinHostPort(host, port)
 		log.Debugf("trying connection to %s", address)
-		c.conn[0], banner, c.ExternalIP, err = tcp.ConnectToTCPServer(address, c.Options.RelayPassword, c.Options.RoomName, durations[i])
+		c.conn[0], banner, c.ExternalIP, err = tcp.ConnectToTCPServerContext(c.stop.ctx, address, c.Options.RelayPassword, c.Options.RoomName, durations[i])
 		if err == nil {
 			c.setRelayControlAddress(address)
 			break
@@ -1863,7 +1916,7 @@ func (c *Client) Receive() (err error) {
 				// }
 
 				serverTry := net.JoinHostPort(ip, port)
-				conn, banner2, externalIP, errConn := tcp.ConnectToTCPServer(serverTry, c.Options.RelayPassword, c.Options.RoomName, 500*time.Millisecond)
+				conn, banner2, externalIP, errConn := tcp.ConnectToTCPServerContext(c.stop.ctx, serverTry, c.Options.RelayPassword, c.Options.RoomName, 500*time.Millisecond)
 				if errConn != nil {
 					log.Debug(errConn)
 					log.Debug("could not connect to " + serverTry)
@@ -1905,7 +1958,7 @@ func (c *Client) Receive() (err error) {
 			output, _ = termui.Output(os.Stderr)
 			fmt.Fprint(output, "\rNo files transferred.\n")
 		}
-	} else if !isTransferDisconnectError(err) {
+	} else if c.ctxErr() == nil && !isTransferDisconnectError(err) {
 		c.SendError()
 	}
 	return
@@ -1952,8 +2005,10 @@ func (c *Client) transfer() (err error) {
 		data, err = c.conn[0].Receive()
 		if err != nil {
 			log.Debugf("got error receiving: %v", err)
-			if !c.Step1ChannelSecured {
-				err = fmt.Errorf("could not secure channel")
+			if ctxErr := c.ctxErr(); ctxErr != nil {
+				err = ctxErr
+			} else if !c.Step1ChannelSecured {
+				err = fmt.Errorf("could not secure channel: %w", err)
 			} else if c.activeTransferStarted() {
 				select {
 				case reportedErr := <-attempt.errc:
@@ -2389,7 +2444,8 @@ func (c *Client) activateSecureChannel(attempt *transferAttemptState) (err error
 			defer wg.Done()
 			server := net.JoinHostPort(relayHost, c.Options.RelayPorts[j])
 			log.Debugf("connecting to %s", server)
-			dataConn, _, _, connErr := tcp.ConnectToTCPServer(
+			dataConn, _, _, connErr := tcp.ConnectToTCPServerContext(
+				c.stop.ctx,
 				server,
 				c.Options.RelayPassword,
 				fmt.Sprintf("%s-%d", c.Options.RoomName, j),
@@ -2622,6 +2678,11 @@ func (c *Client) recipientInitializeFile() (err error) {
 	c.CurrentFile, errOpen = os.OpenFile(
 		pathToFile,
 		os.O_WRONLY, 0o666)
+	if errOpen == nil {
+		if err = c.bindFileToContext(c.CurrentFile); err != nil {
+			return
+		}
+	}
 	var truncate bool // default false
 	c.CurrentFileChunks = []int64{}
 	c.CurrentFileChunkRanges = []int64{}
@@ -2631,11 +2692,15 @@ func (c *Client) recipientInitializeFile() (err error) {
 		if !truncate {
 			// recipient requests the file and chunks (if empty, then should receive all chunks)
 			// TODO: determine the missing chunks
-			c.CurrentFileChunkRanges = utils.MissingChunks(
+			c.CurrentFileChunkRanges, err = utils.MissingChunksCtx(
+				c.stop.ctx,
 				pathToFile,
 				c.FilesToTransfer[c.FilesToTransferCurrentNum].Size,
 				models.TCP_BUFFER_SIZE/2,
 			)
+			if err != nil {
+				return
+			}
 		}
 	} else {
 		if err = rejectSymlinkDestination(pathToFile); err != nil {
@@ -2646,6 +2711,9 @@ func (c *Client) recipientInitializeFile() (err error) {
 			errOpen = fmt.Errorf("could not create %s: %w", pathToFile, errOpen)
 			log.Error(errOpen)
 			return errOpen
+		}
+		if err = c.bindFileToContext(c.CurrentFile); err != nil {
+			return
 		}
 		errChmod := os.Chmod(pathToFile, c.FilesToTransfer[c.FilesToTransferCurrentNum].Mode.Perm())
 		if errChmod != nil {
@@ -2828,7 +2896,7 @@ func (c *Client) updateIfRecipientHasFileInfo() (err error) {
 		var fileHash []byte
 		if errRecipientFile == nil && recipientFileInfo.Size() == fileInfo.Size {
 			// the file exists, but is same size, so hash it
-			fileHash, errHash = utils.HashFile(path.Join(fileInfo.FolderRemote, fileInfo.Name), c.Options.HashAlgorithm, !c.Options.SendingText)
+			fileHash, errHash = c.stop.hash(path.Join(fileInfo.FolderRemote, fileInfo.Name), c.Options.HashAlgorithm, !c.Options.SendingText)
 		}
 		if fileInfo.Size == 0 || fileInfo.Symlink != "" {
 			err = c.createEmptyFileAndFinish(fileInfo, i)
@@ -2850,11 +2918,16 @@ func (c *Client) updateIfRecipientHasFileInfo() (err error) {
 			}
 			if errHash == nil && !c.Options.Overwrite && !c.Options.Rename && errRecipientFile == nil && !strings.HasPrefix(fileInfo.Name, "croc-stdin-") && !c.Options.SendingText {
 
-				missingChunks := utils.ChunkRangesToChunks(utils.MissingChunks(
+				missingRanges, missingErr := utils.MissingChunksCtx(
+					c.stop.ctx,
 					path.Join(fileInfo.FolderRemote, fileInfo.Name),
 					fileInfo.Size,
 					models.TCP_BUFFER_SIZE/2,
-				))
+				)
+				if missingErr != nil {
+					return missingErr
+				}
+				missingChunks := utils.ChunkRangesToChunks(missingRanges)
 				percentDone := 100 - float64(len(missingChunks)*models.TCP_BUFFER_SIZE/2)/float64(fileInfo.Size)*100
 
 				log.Debug("asking to overwrite")
@@ -2976,14 +3049,26 @@ func (c *Client) updateState(attempt *transferAttemptState) (err error) {
 			c.FilesToTransfer[c.FilesToTransferCurrentNum].FolderSource,
 			c.FilesToTransfer[c.FilesToTransferCurrentNum].Name,
 		)
-		c.fread, err = os.Open(pathToFile)
+		fread, openErr := os.Open(pathToFile)
 		c.numfinished = 0
-		if err != nil {
+		if openErr != nil {
+			err = openErr
+			return
+		}
+		c.mutex.Lock()
+		if ctxErr := c.ctxErr(); ctxErr != nil {
+			c.mutex.Unlock()
+			_ = fread.Close()
+			return ctxErr
+		}
+		c.fread = fread
+		c.mutex.Unlock()
+		if err = c.bindFileToContext(fread); err != nil {
 			return
 		}
 		for i := 0; i < len(c.Options.RelayPorts); i++ {
 			log.Debugf("starting sending over comm %d", i)
-			go c.sendData(i, c.conn[i+1], c.fread, attempt)
+			go c.sendData(i, c.conn[i+1], fread, attempt)
 		}
 	}
 	return
@@ -3155,7 +3240,10 @@ func (c *Client) sendData(i int, dataConn *comm.Comm, fread *os.File, attempt *t
 			if c.limiter != nil {
 				r := c.limiter.ReserveN(time.Now(), n)
 				log.Debugf("Limiting Upload for %d", r.Delay())
-				time.Sleep(r.Delay())
+				if waitErr := utils.WaitContext(c.stop.ctx, r.Delay()); waitErr != nil {
+					r.CancelAt(time.Now())
+					return
+				}
 			}
 			if n > 0 {
 				// check to see if this is a chunk that the recipient wants

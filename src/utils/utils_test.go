@@ -14,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,69 @@ import (
 const TCP_BUFFER_SIZE = 1024 * 64
 
 var bigFileSize = 75000000
+
+func TestWaitContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	if err := WaitContext(ctx, time.Minute); !errors.Is(err, context.Canceled) {
+		t.Fatal("context-aware wait did not return cancellation")
+	}
+	if time.Since(started) > time.Second {
+		t.Fatal("context-aware wait cancellation exceeded one second")
+	}
+}
+
+func TestMissingChunksCtxCancellationAndCompatibility(t *testing.T) {
+	fileName := filepath.Join(t.TempDir(), "missing-chunks.bin")
+	content := make([]byte, 4*1024)
+	copy(content[1024:2048], bytes.Repeat([]byte{1}, 1024))
+	if err := os.WriteFile(fileName, content, 0o600); err != nil {
+		t.Fatalf("create chunk fixture: %v", err)
+	}
+
+	got, err := MissingChunksCtx(context.Background(), fileName, int64(len(content)), 1024)
+	if err != nil {
+		t.Fatalf("scan chunks: %v", err)
+	}
+	want := MissingChunks(fileName, int64(len(content)), 1024)
+	if !slices.Equal(got, want) {
+		t.Fatal("context chunk scan differs from compatibility wrapper")
+	}
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := MissingChunksCtx(canceledCtx, fileName, int64(len(content)), 1024); !errors.Is(err, context.Canceled) {
+		t.Fatal("pre-canceled chunk scan did not return context cancellation")
+	}
+
+	largeFile := filepath.Join(t.TempDir(), "large-sparse.bin")
+	if err := os.WriteFile(largeFile, nil, 0o600); err != nil {
+		t.Fatalf("create sparse chunk fixture: %v", err)
+	}
+	if err := os.Truncate(largeFile, 128*1024*1024); err != nil {
+		t.Fatalf("create sparse chunk fixture: %v", err)
+	}
+	ctx, cancelScan := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, scanErr := MissingChunksCtx(ctx, largeFile, 128*1024*1024, 32*1024)
+		result <- scanErr
+	}()
+	cancelScan()
+	select {
+	case scanErr := <-result:
+		if !errors.Is(scanErr, context.Canceled) {
+			t.Fatal("active chunk scan did not return context cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active chunk scan did not stop after cancellation")
+	}
+	renamed := largeFile + ".renamed"
+	if err := os.Rename(largeFile, renamed); err != nil {
+		t.Fatalf("chunk scan left its file handle open: %v", err)
+	}
+}
 
 func bigFile() {
 	os.WriteFile("bigfile.test", bytes.Repeat([]byte("z"), bigFileSize), 0o666)

@@ -2,15 +2,99 @@ package comm
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	log "github.com/schollz/logger"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestNewConnectionContextAlreadyCanceled(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	connection, err := NewConnectionContext(ctx, listener.Addr().String(), time.Minute)
+	if connection != nil || !errors.Is(err, context.Canceled) {
+		t.Fatal("canceled context was not returned before dialing")
+	}
+	tcpListener := listener.(*net.TCPListener)
+	if err := tcpListener.SetDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("set listener deadline: %v", err)
+	}
+	if accepted, acceptErr := listener.Accept(); acceptErr == nil {
+		accepted.Close()
+		t.Fatal("already-canceled dial reached the listener")
+	}
+}
+
+func TestNewConnectionContextCancelClosesBlockedReceive(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			accepted <- connection
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	client, err := NewConnectionContext(ctx, listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	peer := <-accepted
+	defer peer.Close()
+	receiveResult := make(chan error, 1)
+	go func() {
+		_, receiveErr := client.Receive()
+		receiveResult <- receiveErr
+	}()
+
+	started := time.Now()
+	cancel()
+	select {
+	case receiveErr := <-receiveResult:
+		if !errors.Is(receiveErr, context.Canceled) {
+			t.Fatal("blocked receive did not return context cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked receive did not unblock after cancellation")
+	}
+	if time.Since(started) > time.Second {
+		t.Fatal("connection cancellation exceeded one second")
+	}
+	if err := peer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set peer deadline: %v", err)
+	}
+	if _, err := peer.Read(make([]byte, 1)); err == nil {
+		t.Fatal("peer did not observe the canceled connection closing")
+	}
+
+	var closeWait sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		closeWait.Add(1)
+		go func() {
+			defer closeWait.Done()
+			client.Close()
+		}()
+	}
+	closeWait.Wait()
+}
 
 func TestComm(t *testing.T) {
 	token := make([]byte, 3000)

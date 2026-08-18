@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,6 +32,7 @@ func TestMain(m *testing.M) {
 type loopbackRelay struct {
 	address  string
 	password string
+	stop     func()
 }
 
 func unusedLoopbackPort(t *testing.T) string {
@@ -97,20 +99,24 @@ func startLoopbackRelayWithDataPorts(t *testing.T, dataPortCount int) loopbackRe
 	address := net.JoinHostPort("127.0.0.1", controlPort)
 	waitForLoopbackListener(t, address)
 
-	t.Cleanup(func() {
-		cancel()
-		for i := 0; i < dataPortCount+1; i++ {
-			select {
-			case err := <-serverErrors:
-				if err != nil {
-					t.Errorf("stop loopback relay: %v", err)
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			cancel()
+			for i := 0; i < dataPortCount+1; i++ {
+				select {
+				case err := <-serverErrors:
+					if err != nil {
+						t.Errorf("stop loopback relay: %v", err)
+					}
+				case <-time.After(3 * time.Second):
+					t.Error("loopback relay did not stop")
 				}
-			case <-time.After(3 * time.Second):
-				t.Error("loopback relay did not stop")
 			}
-		}
-	})
-	return loopbackRelay{address: address, password: password}
+		})
+	}
+	t.Cleanup(stop)
+	return loopbackRelay{address: address, password: password, stop: stop}
 }
 
 func changeWorkingDirectory(t *testing.T, directory string) {
@@ -160,19 +166,7 @@ func newTransferClients(
 	approver croc.ManifestApprover,
 ) (*croc.Client, *croc.Client) {
 	t.Helper()
-	common := croc.Options{
-		SharedSecret:             secret,
-		RelayAddress:             relay.address,
-		RelayPassword:            relay.password,
-		NoPrompt:                 true,
-		NoMultiplexing:           true,
-		DisableLocal:             true,
-		Curve:                    "siec",
-		Overwrite:                true,
-		NoCompress:               true,
-		DisableClipboard:         true,
-		SuppressSendInstructions: true,
-	}
+	common := transferOptions(relay, secret)
 	senderOptions := common
 	senderOptions.IsSender = true
 	sender, err := croc.NewCtx(senderCtx, senderOptions)
@@ -186,6 +180,22 @@ func newTransferClients(
 		t.Fatalf("create receiver: %v", err)
 	}
 	return sender, receiver
+}
+
+func transferOptions(relay loopbackRelay, secret string) croc.Options {
+	return croc.Options{
+		SharedSecret:             secret,
+		RelayAddress:             relay.address,
+		RelayPassword:            relay.password,
+		NoPrompt:                 true,
+		NoMultiplexing:           true,
+		DisableLocal:             true,
+		Curve:                    "siec",
+		Overwrite:                true,
+		NoCompress:               true,
+		DisableClipboard:         true,
+		SuppressSendInstructions: true,
+	}
 }
 
 type transferResult struct {

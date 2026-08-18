@@ -12,12 +12,14 @@ import (
 
 // stop manages graceful shutdown of the TCP server
 type stop struct {
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx        context.Context
+	cancel     context.CancelFunc
+	cancelOnce sync.Once
 	// Track connections
-	server net.Listener
-	wg     sync.WaitGroup
-	gui    bool
+	serverMu sync.Mutex
+	server   net.Listener
+	wg       sync.WaitGroup
+	gui      bool
 }
 
 // newStop creates a new stop manager
@@ -34,9 +36,23 @@ func newStop(ctx context.Context) *stop {
 // Cancel initiate graceful shutdown
 func (s *stop) Cancel() {
 	log.Trace("tcp Cancel")
-	if s.cancel != nil {
-		s.cancel()
-		s.cancel = nil
+	s.cancelOnce.Do(s.cancel)
+}
+
+func (s *stop) setServer(server net.Listener) {
+	s.serverMu.Lock()
+	s.server = server
+	s.serverMu.Unlock()
+}
+
+func (s *stop) closeServer() {
+	s.serverMu.Lock()
+	server := s.server
+	s.server = nil
+	s.serverMu.Unlock()
+	if server != nil {
+		log.Debugf("stop TCP server on %s", server.Addr())
+		_ = server.Close()
 	}
 }
 
@@ -46,9 +62,7 @@ func RunCtx(ctx context.Context, debugLevel, host, port, password string, banner
 
 func WithCtx(ctx context.Context) serverOptsFunc {
 	return func(s *server) error {
-		if s.stop.cancel != nil {
-			s.stop.cancel()
-		}
+		s.stop.Cancel()
 		s.stop = newStop(ctx)
 		s.stop.gui = true
 		return nil

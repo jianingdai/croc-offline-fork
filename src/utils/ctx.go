@@ -2,9 +2,11 @@
 package utils
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +16,24 @@ import (
 	"github.com/minio/highwayhash"
 	"github.com/schollz/progressbar/v3"
 )
+
+// WaitContext waits for duration or returns early when ctx is canceled.
+func WaitContext(ctx context.Context, duration time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 // ctxFile wraps os.File with context cancellation support.
 type ctxFile struct {
@@ -69,9 +89,18 @@ func (c *ctxFile) Seek(offset int64, whence int) (n int64, err error) {
 }
 
 // HashFileCtx returns the hash of a file with context cancellation support.
-func HashFileCtx(ctx context.Context, fname string, algorithm string, showProgress ...bool) ([]byte, error) {
+func HashFileCtx(ctx context.Context, fname string, algorithm string, showProgress ...bool) (hash []byte, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	defer func() {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			hash = nil
+			err = ctxErr
+		}
+	}()
 	// Quick context check before starting
-	if err := ctx.Err(); err != nil {
+	if err = ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -94,6 +123,10 @@ func HashFileCtx(ctx context.Context, fname string, algorithm string, showProgre
 		return nil, err
 	}
 	defer f.Close()
+	stopClose := context.AfterFunc(ctx, func() {
+		_ = f.Close()
+	})
+	defer stopClose()
 
 	// Get file info for size (now file is opened, following symlinks if any)
 	fi, err := f.Stat()
@@ -143,16 +176,113 @@ func HashFileCtx(ctx context.Context, fname string, algorithm string, showProgre
 	// Dispatch to appropriate hash function
 	switch algorithm {
 	case "imohash":
-		return IMOHashReader(sr, bar)
+		hash, err = IMOHashReader(sr, bar)
 	case "md5":
-		return MD5HashReader(sr, bar)
+		hash, err = MD5HashReader(sr, bar)
 	case "xxhash":
-		return XXHashReader(sr, bar)
+		hash, err = XXHashReader(sr, bar)
 	case "highway":
-		return HighwayHashReader(sr, bar)
+		hash, err = HighwayHashReader(sr, bar)
 	default:
-		return nil, fmt.Errorf("unsupported algorithm: %s", algorithm)
+		err = fmt.Errorf("unsupported algorithm: %s", algorithm)
 	}
+	return
+}
+
+// MissingChunksCtx returns missing chunk ranges and stops scanning promptly on
+// context cancellation. A missing file or size mismatch keeps the legacy
+// meaning of an empty range: request the complete file.
+func MissingChunksCtx(ctx context.Context, fname string, fsize int64, chunkSize int) (chunkRanges []int64, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
+	if chunkSize <= 0 {
+		return nil, fmt.Errorf("chunk size must be positive")
+	}
+	f, err := os.Open(fname)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	stopClose := context.AfterFunc(ctx, func() {
+		_ = f.Close()
+	})
+	defer stopClose()
+
+	fstat, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if fstat.Size() != fsize {
+		return nil, nil
+	}
+
+	var bar *progressbar.ProgressBar
+	showProgress := fsize > 10*1024*1024
+	if showProgress {
+		fnameShort := shortenProgressFilename(fname)
+		bar = progressbar.NewOptions64(fsize,
+			progressbar.OptionSetWriter(os.Stderr),
+			progressbar.OptionShowBytes(true),
+			progressbar.OptionSetDescription(fmt.Sprintf("Checking %s", fnameShort)),
+			progressbar.OptionClearOnFinish(),
+			progressbar.OptionFullWidth(),
+			progressbar.OptionThrottle(100*time.Millisecond),
+		)
+		defer bar.Finish()
+	}
+
+	emptyBuffer := make([]byte, chunkSize)
+	chunks := make([]int64, 0)
+	var currentLocation int64
+	for {
+		if err = ctx.Err(); err != nil {
+			return nil, err
+		}
+		buffer := make([]byte, chunkSize)
+		var bytesRead int
+		bytesRead, err = f.Read(buffer)
+		if bytesRead > 0 {
+			if bytes.Equal(buffer[:bytesRead], emptyBuffer[:bytesRead]) {
+				chunks = append(chunks, currentLocation)
+			}
+			currentLocation += int64(bytesRead)
+			if bar != nil {
+				_ = bar.Add(bytesRead)
+			}
+		}
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+	}
+	if len(chunks) == 0 {
+		return []int64{}, nil
+	}
+
+	chunkRanges = []int64{int64(chunkSize), chunks[0]}
+	currentCount := int64(1)
+	for i := 1; i < len(chunks); i++ {
+		if chunks[i]-chunks[i-1] > int64(chunkSize) {
+			chunkRanges = append(chunkRanges, currentCount, chunks[i])
+			currentCount = 1
+			continue
+		}
+		currentCount++
+	}
+	chunkRanges = append(chunkRanges, currentCount)
+	return chunkRanges, nil
 }
 
 // IMOHashReader returns imohash for a SectionReader.
