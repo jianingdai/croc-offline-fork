@@ -69,8 +69,16 @@ func startLoopbackRelay(t *testing.T) loopbackRelay {
 
 func startLoopbackRelayWithDataPorts(t *testing.T, dataPortCount int) loopbackRelay {
 	t.Helper()
+	return startLoopbackRelayWithDataPortsAndPassword(t, dataPortCount, "test-only-relay-password")
+}
+
+func startLoopbackRelayWithDataPortsAndPassword(t *testing.T, dataPortCount int, password string) loopbackRelay {
+	t.Helper()
 	if dataPortCount < 1 {
 		t.Fatal("loopback relay needs at least one data port")
+	}
+	if password == "" {
+		t.Fatal("loopback relay needs a password")
 	}
 	controlPort := unusedLoopbackPort(t)
 	dataPorts := make([]string, 0, dataPortCount)
@@ -83,7 +91,6 @@ func startLoopbackRelayWithDataPorts(t *testing.T, dataPortCount int) loopbackRe
 		usedPorts[port] = struct{}{}
 		dataPorts = append(dataPorts, port)
 	}
-	password := "test-only-relay-password"
 	ctx, cancel := context.WithCancel(context.Background())
 	serverErrors := make(chan error, dataPortCount+1)
 	for _, dataPort := range dataPorts {
